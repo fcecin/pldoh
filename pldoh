@@ -1,0 +1,3051 @@
+#!/usr/bin/perl
+
+# --------------------------------------------------------------------------------------------
+# pldoh (perl client for Dynamics of Hegemony)
+#
+# Run "pldoh -h" for help.
+#
+# Project repository: https://github.com/FluxBP/pldoh
+#
+# pldoh is intended as a fully-featured command-line client for playing DoH, and it is also
+#   intended as a front-end for other clients that provide more advanced functionality.
+# pldoh abstracts away the cleos wallet, configuration options, querying the blockchain,
+#   caching game state, and issuing game commands and other transactions to the blockchain,
+#   solving all basic error handling and timing issues.
+# In its interactive mode, it is playable via simple menus shown to the user. In batch mode,
+#   it is suited both for interactive play and as a front-end to other clients.
+# pldoh was written for an UNIX environment, and was developed and tested on Ubuntu 22.04.
+#   AFAIK, no additional Perl modules other than the ones that come with the default Perl
+#   installation for Ubuntu are required. It should be possible to port it to Windows.
+# pldoh features and versioning have to be extracted directly from the git repo history. The
+#   idea is that pldoh is always up-to-date with the on-chain game contracts; if it isn't,
+#   then it will be, soon.
+# In case the game data model cache gets somehow obsolete or corrupted, just delete all data
+#   files and pldoh will fetch the most recent version of everything again as it is needed.
+# --------------------------------------------------------------------------------------------
+#
+# TODO:
+#
+# - LATER: make --abi output prettier (more compact; with more insight on e.g. action parameters and
+#          struct field formatting, and all other elements)
+#
+# - LATER: add politics AND staking to batch play commands
+#
+# - LATER: think about the code duplication between interactive mode and batch mode (e.g. cleos push action doeng x 2)
+#   see if there's common code that can be replaced by subs that are common to both -- or ONE sub that knows how
+#   to carry out any action with named parameters (better)
+#
+# - LATER: support other keytypes other than i64/name (composite key e.g. for secondary index of tile)
+#
+# - LATER: add the ability to use game strings in the command line e.g. mineral, tool, farm, freight truck, etc. that translate
+#   to IDs (get the mapping from the data model)
+#   for example use freight-truck or freight_truck or "freight truck" (with commas) to force exact match to "freight truck"
+#       and it replaces with the id.
+#
+# - LATER: solve character name to character id in command line
+#
+# - LATER: solve "all" in place of quantity for dopickup & dodropoff
+#
+# - LATER: solve tile direction in place of tile id for --domove (N,W,E,S,SW,NW,SE,NE)
+#
+# - LATER: add token-manipulation functions for TCN and etc. balances.
+#          send and receive tokens (transfer, stake, unstake)
+#
+# - LATER: when finishing this, we want to make it so that
+#   - the player/char displays, and menu cards, all display relevant information
+#     for the player that's not an entire JSON dump, but its actually nicely formatted
+#   - AND, we want the feature where refreshing a player and a character will COMPARE
+#     with the previous state and PRINT the delta in the console.
+#
+# - LATER, we want to be actively polling only when we expect a change (e.g. player resources)
+#   if pending rng resolution, start polling player every 45 secs
+#   poll the rng too if there are pending rng
+#   once no pending rng, stop polling rng
+#   wait until the player doxxx something, then trigger the start of polling the rng
+#   // Figure out how to trigger player updates only when RNG requests are resolving.
+#   i.e. after an initial query to the RNG table, we would know if there's anything
+#        pending a resolve (we count those and display).
+#
+# - LATER: in menu mode, resolve state queries on a separate thread so they don't lock up the UI
+#
+# - LATER: sub and --cmd get the adjacent tiles of a tile N, S, NE, SE, NW, SW
+#          W -> SW or NW, depending on tile X coordinate %2
+#          E -> SE or NE, depending on tile X coordinate %2
+#
+# - LATER: complete the menu play design (e.g. how to display terrain, input forms, multiple windows)
+#
+# - LATER: implement a better console-log window that resizes strings when the screen resizes
+#
+# - LATER: add scroll to console
+#
+# - LATER: complete menu play
+# --------------------------------------------------------------------------------------------
+
+# --------------------------------------------------------------------------------------------
+# Temporary hacks
+# --------------------------------------------------------------------------------------------
+
+# FIXME/TODO: Set this to "" (or remove variable entirely) when using Leap 4+ chain & API
+my $old_rpc_postfix = " -t false --use-old-send-rpc";
+
+# --------------------------------------------------------------------------------------------
+# Modules
+# --------------------------------------------------------------------------------------------
+
+# Core modules (no need to install, apparently)
+use strict;
+use warnings;
+use Scalar::Util qw(looks_like_number);
+use POSIX qw(strerror);
+use Time::HiRes qw(sleep);
+use Getopt::Long;
+use File::stat;
+use File::Find;
+use File::Path qw(remove_tree);
+
+# to install: sudo cpan Term::ReadKey
+use Term::ReadKey;
+
+# to install: sudo cpan Curses (?)
+BEGIN { $Curses::OldCurses = 1; }    # FIXME/TODO: can we get rid of this? i.e. convert old curses calls to new curses calls
+use Curses;
+
+# --------------------------------------------------------------------------------------------
+# Mini JSON parser copied from JSON::Tiny
+# --------------------------------------------------------------------------------------------
+
+# To instead have the Tiny.pm file in the current dir as a separate file:
+# use lib '.'; # Find Tiny.pm in current dir
+# use Tiny;    # Simple JSON parser from https://github.com/daoswald/JSON-Tiny/
+
+{
+package JSON::Tiny;
+
+# Minimalistic JSON. Adapted from Mojo::JSON. (c)2012-2015 David Oswald
+# License: Artistic 2.0 license.
+# http://www.perlfoundation.org/artistic_license_2_0
+
+use Scalar::Util 'blessed';
+use Encode ();
+use B;
+
+# our $VERSION = '0.58';
+
+# Literal names
+# Users may override Booleans with literal 0 or 1 if desired.
+our($FALSE, $TRUE) = map { bless \(my $dummy = $_), 'JSON::Tiny::_Bool' } 0, 1;
+
+# Escaped special character map with u2028 and u2029
+my %ESCAPE = (
+  '"'     => '"',
+  '\\'    => '\\',
+  '/'     => '/',
+  'b'     => "\x08",
+  'f'     => "\x0c",
+  'n'     => "\x0a",
+  'r'     => "\x0d",
+  't'     => "\x09",
+  'u2028' => "\x{2028}",
+  'u2029' => "\x{2029}"
+);
+my %REVERSE = map { $ESCAPE{$_} => "\\$_" } keys %ESCAPE;
+
+for(0x00 .. 0x1f) {
+  my $packed = pack 'C', $_;
+  $REVERSE{$packed} = sprintf '\u%.4X', $_ unless defined $REVERSE{$packed};
+}
+
+sub decode_json {
+  my $err = _decode(\my $value, shift);
+
+  # pldoh patch: just return undef if any parse error
+  #return defined $err ? croak $err : $value;
+  return defined $err ? undef : $value;
+}
+
+sub encode_json { Encode::encode 'UTF-8', _encode_value(shift) }
+
+sub false () {$FALSE}  ## no critic (prototypes)
+
+sub from_json {
+  my $err = _decode(\my $value, shift, 1);
+  # pldoh patch: just return undef if any parse error
+  #return defined $err ? croak $err : $value;
+  return defined $err ? undef : $value;
+}
+
+sub j {
+  return encode_json $_[0] if ref $_[0] eq 'ARRAY' || ref $_[0] eq 'HASH';
+  return decode_json $_[0];
+}
+
+sub to_json { _encode_value(shift) }
+
+sub true () {$TRUE} ## no critic (prototypes)
+
+sub _decode {
+  my $valueref = shift;
+
+  eval {
+
+    # Missing input
+    die "Missing or empty input\n" unless length( local $_ = shift );
+
+    # UTF-8
+    $_ = eval { Encode::decode('UTF-8', $_, 1) } unless shift;
+    die "Input is not UTF-8 encoded\n" unless defined $_;
+
+    # Value
+    $$valueref = _decode_value();
+
+    # Leftover data
+    return m/\G[\x20\x09\x0a\x0d]*\z/gc || _throw('Unexpected data');
+  } ? return undef : chomp $@;
+
+  return $@;
+}
+
+sub _decode_array {
+  my @array;
+  until (m/\G[\x20\x09\x0a\x0d]*\]/gc) {
+
+    # Value
+    push @array, _decode_value();
+
+    # Separator
+    redo if m/\G[\x20\x09\x0a\x0d]*,/gc;
+
+    # End
+    last if m/\G[\x20\x09\x0a\x0d]*\]/gc;
+
+    # Invalid character
+    _throw('Expected comma or right square bracket while parsing array');
+  }
+
+  return \@array;
+}
+
+sub _decode_object {
+  my %hash;
+  until (m/\G[\x20\x09\x0a\x0d]*\}/gc) {
+
+    # Quote
+    m/\G[\x20\x09\x0a\x0d]*"/gc
+      or _throw('Expected string while parsing object');
+
+    # Key
+    my $key = _decode_string();
+
+    # Colon
+    m/\G[\x20\x09\x0a\x0d]*:/gc
+      or _throw('Expected colon while parsing object');
+
+    # Value
+    $hash{$key} = _decode_value();
+
+    # Separator
+    redo if m/\G[\x20\x09\x0a\x0d]*,/gc;
+
+    # End
+    last if m/\G[\x20\x09\x0a\x0d]*\}/gc;
+
+    # Invalid character
+    _throw('Expected comma or right curly bracket while parsing object');
+  }
+
+  return \%hash;
+}
+
+sub _decode_string {
+  my $pos = pos;
+
+  # Extract string with escaped characters
+  m!\G((?:(?:[^\x00-\x1f\\"]|\\(?:["\\/bfnrt]|u[0-9a-fA-F]{4})){0,32766})*)!gc; # segfault on 5.8.x in t/20-mojo-json.t
+  my $str = $1;
+
+  # Invalid character
+  unless (m/\G"/gc) {
+    _throw('Unexpected character or invalid escape while parsing string')
+      if m/\G[\x00-\x1f\\]/;
+    _throw('Unterminated string');
+  }
+
+  # Unescape popular characters
+  if (index($str, '\\u') < 0) {
+    $str =~ s!\\(["\\/bfnrt])!$ESCAPE{$1}!gs;
+    return $str;
+  }
+
+  # Unescape everything else
+  my $buffer = '';
+  while ($str =~ m/\G([^\\]*)\\(?:([^u])|u(.{4}))/gc) {
+    $buffer .= $1;
+
+    # Popular character
+    if ($2) { $buffer .= $ESCAPE{$2} }
+
+    # Escaped
+    else {
+      my $ord = hex $3;
+
+      # Surrogate pair
+      if (($ord & 0xf800) == 0xd800) {
+
+        # High surrogate
+        ($ord & 0xfc00) == 0xd800
+          or pos($_) = $pos + pos($str), _throw('Missing high-surrogate');
+
+        # Low surrogate
+        $str =~ m/\G\\u([Dd][C-Fc-f]..)/gc
+          or pos($_) = $pos + pos($str), _throw('Missing low-surrogate');
+
+        $ord = 0x10000 + ($ord - 0xd800) * 0x400 + (hex($1) - 0xdc00);
+      }
+
+      # Character
+      $buffer .= pack 'U', $ord;
+    }
+  }
+
+  # The rest
+  return $buffer . substr $str, pos $str, length $str;
+}
+
+sub _decode_value {
+
+  # Leading whitespace
+  m/\G[\x20\x09\x0a\x0d]*/gc;
+
+  # String
+  return _decode_string() if m/\G"/gc;
+
+  # Object
+  return _decode_object() if m/\G\{/gc;
+
+  # Array
+  return _decode_array() if m/\G\[/gc;
+
+  # Number
+  my ($i) = /\G([-]?(?:0|[1-9][0-9]*)(?:\.[0-9]*)?(?:[eE][+-]?[0-9]+)?)/gc;
+  return 0 + $i if defined $i;
+
+  # True
+  return $TRUE if m/\Gtrue/gc;
+
+  # False
+  return $FALSE if m/\Gfalse/gc;
+
+  # Null
+  return undef if m/\Gnull/gc;  ## no critic (return)
+
+  # Invalid character
+  _throw('Expected string, array, object, number, boolean or null');
+}
+
+sub _encode_array {
+  '[' . join(',', map { _encode_value($_) } @{$_[0]}) . ']';
+}
+
+sub _encode_object {
+  my $object = shift;
+  my @pairs = map { _encode_string($_) . ':' . _encode_value($object->{$_}) }
+    sort keys %$object;
+  return '{' . join(',', @pairs) . '}';
+}
+
+sub _encode_string {
+  my $str = shift;
+  $str =~ s!([\x00-\x1f\x{2028}\x{2029}\\"/])!$REVERSE{$1}!gs;
+  return "\"$str\"";
+}
+
+sub _encode_value {
+  my $value = shift;
+
+  # Reference
+  if (my $ref = ref $value) {
+
+    # Object
+    return _encode_object($value) if $ref eq 'HASH';
+
+    # Array
+    return _encode_array($value) if $ref eq 'ARRAY';
+
+    # True or false
+    return $$value ? 'true' : 'false' if $ref eq 'SCALAR';
+    return $value  ? 'true' : 'false' if $ref eq 'JSON::Tiny::_Bool'; #'JSON_Bool';
+
+    # Blessed reference with TO_JSON method
+    if (blessed $value && (my $sub = $value->can('TO_JSON'))) {
+      return _encode_value($value->$sub);
+    }
+  }
+
+  # Null
+  return 'null' unless defined $value;
+
+  # Number (bitwise operators change behavior based on the internal value type)
+
+  return $value
+    if B::svref_2object(\$value)->FLAGS & (B::SVp_IOK | B::SVp_NOK)
+    # filter out "upgraded" strings whose numeric form doesn't strictly match
+    && 0 + $value eq $value
+    # filter out inf and nan
+    && $value * 0 == 0;
+
+  # String
+  return _encode_string($value);
+}
+
+sub _throw {
+
+  # Leading whitespace
+  m/\G[\x20\x09\x0a\x0d]*/gc;
+
+  # Context
+  my $context = 'Malformed JSON: ' . shift;
+  if (m/\G\z/gc) { $context .= ' before end of data' }
+  else {
+    my @lines = split "\n", substr($_, 0, pos);
+    $context .= ' at line ' . @lines . ', offset ' . length(pop @lines || '');
+  }
+
+  die "$context\n";
+}
+
+# Emulate boolean type
+
+package JSON::Tiny::_Bool;
+use overload '""' => sub { ${$_[0]} }, fallback => 1;
+1;
+}
+
+# --------------------------------------------------------------------------------------------
+# Core global variables
+# --------------------------------------------------------------------------------------------
+
+my $id_key = 'id';  # name of the object ID key across most(all?) smart contract tables
+
+my $hgm = "hgm";   # smart contract suffix (e.g. hegemon.hgm)
+my $tcn = "tcn";   # smart contract suffix (e.g. staking.tcn)
+
+my $keosd_log = "keosd.log";
+
+my $pldoh_config = "pldoh.ini";
+
+my $log_file_name = 'log';  # log file for interactive mode only (since we take over the screen)
+my $con_log_prefix = '| ';
+
+my $pldoh_unlock_sh = "pldoh_unlock.sh";
+my $pldoh_cleos_sh = "pldoh_cleos.sh";
+
+my $postfix = " 2>&1"; # redirect cleos STDERR to STDOUT so that we can capture it with =``
+
+# key (variable) names for pldoh.ini config file
+my $chain_name_key = "chain-name";
+my $chain_api_key = "chain-api";
+my $player_key = "player";
+my $need_auth_check_key = "need-auth-check";
+my $tcn_key = "tcn"; # set to 0, 1 or 2  (hgm/tcn , hg1/tc1 , hg2/tc2)
+
+my $players_dir = "p";   # default name for the subdirectory that contains account-name
+                         #   (player-name) subdirectories
+
+my $forever_seconds = 31536000;   # one year -- cache retention for load_dm() game content
+
+my $default_get_expiration_seconds = 2592000;  # default cache retention for get_xxx() (1 month)
+
+my $force_query_contract = '';   # forced FULL contract name (prefix AND suffix, e.g. "hegemon.hgm" to query). empty=guess.
+
+my $player = '';  # selected player account to play with (default empty = none is defined)
+my $player_data_dir = ''; # computed later
+
+my $api = ''; # selected API node URL (default empty = none is defined)
+
+# Tracks need to check for player accout having the necessary keys to authorize transactions
+#   when in interactive (menu) mode.
+my $need_auth_check = 1;
+
+# By default, we are going in interactive menu mode. But if we find work to do via supplied
+#   command-line arguments, this is set to 0, which skips the menu session and pldoh exits.
+my $menu = 1;
+
+# Another main mode: when $menu = 0, this may be set to 0 to indicate that signing transactions
+#   will not be needed (because no command-line switches will cause it) and so we can e.g.
+#   skip wallet unlock and a possible auth check (if that's not already disabled).
+# When $menu = 1, this should be always on.
+# This will be turned on below as we get any indication that we're going to need it.
+my $txsign = 0;
+
+# By default, run in verbose mode.
+my $verbose = 1;
+
+# By default, do not force muting. Muting is usually bad, unless you know what you are doing.
+my $mute = 0;
+
+# temp
+my $o;
+
+# This is the "data model".
+# It was created to load all the table elements that are used to make decisions on program
+#   start, mostly. FIXME/TODO: use it in the interactive (menu) mode as well.
+# The data model is an "amalgamation" structure; you keep inserting or overwriting elements.
+# If you query for an element *specifically* and it is not returned, you may determine that
+#   it has been deleted, and remove it from the model, but usually we will be mostly
+#   upserting elements by their contract->table->unique id.
+# The first level of KV mapping (Perl hashes %) has contract names.
+# Inside the contract hash you get a hash for every table.
+# Inside every table you get elements, mapped by their global unique ids.
+# There can be gaps in the model, but thankfully, the global ids are expected to be stable,
+#   so you can miss elements, and the content of the elements can have temporal differences
+#   and so temporal inconsistencies (which can be compensated by the client), but you cannot
+#   have an element that has changed its id for example and overwritten another element.
+my %dm = ();
+
+# This is cleos get abi equivalent of the $dm above.
+# Key is contract name, value is the Perl hash with the deserialized JSON string for the ABI.
+my %abis = ();
+
+# --------------------------------------------------------------------------------------------
+# Solve $RealBin and $cleos since these will be used in the util sub's
+# --------------------------------------------------------------------------------------------
+
+# This adds the current directory to the PATH, so that if cleos and keosd are there, they
+#   will be found. That's an alternative to having the leap .deb installed in the system.
+use FindBin qw($RealBin);
+use Env qw(@PATH);
+push @PATH, $RealBin;
+
+# cleos prefix with wallet URL
+
+#my $cleos = "cleos --wallet-url unix://$RealBin/keosd.sock";
+#
+# Should work pointing to the current directory, so if you copy the directory
+#   with pldoh and pldoh_unlock.sh, it will still work.
+# This script is not going to be changing the current directory while it runs.
+#
+my $cleos = "cleos --wallet-url unix://./keosd.sock";
+
+# --------------------------------------------------------------------------------------------
+# Utilities
+# --------------------------------------------------------------------------------------------
+
+# Check valid Antelope account name
+sub valid_name {
+    my $str = shift;
+    return 0 if length($str) < 1 || length($str) > 12; # Check length between 1 and 12 characters
+    return 0 unless $str =~ /^(?!.*[^1-5a-z\.])[1-5a-z\.]+$/; # Check allowed characters
+    return 0 if $str =~ /^\./ || $str =~ /\.$/ || $str =~ /\.\./; # Check dot position
+    return 1; # All checks passed, the string is valid
+}
+
+sub save_selected_player_to_config {
+    print "Saving provided player name selection to $pldoh_config\n";
+    open(my $file_handle, '>>', $pldoh_config) or die "Cannot open file $pldoh_config for append: $!";
+    print $file_handle "player = $player\n";
+    close($file_handle);
+}
+
+sub validate_selected_player_name {
+    if (!valid_name($player)) {
+        print "ERR-040: Provided player name $player is an invalid Antelope blockchain account name.\n";
+        exit 1;
+    }
+}
+
+sub check_interactive_player_selection_enabled {
+    # if not in menu mode (interactive mode), then error out
+    if (! $menu) {
+        print "ERR-007: No player name provided.\n";
+        print "\n";
+        print "Solution 1: run in interactive mode (not batch mode) and pldoh will ask\n";
+        print "  for the player name interactively.\n";
+        print "Solution 2: provide player name in $pldoh_config or via command-line\n";
+        print "  arguments.\n";
+        exit 1;
+    }
+}
+
+sub dump_hash {
+    my ($hash_ref, $indent) = @_;
+    my $o = '';
+    $indent //= 0;
+    my $indentation = " " x $indent;
+    foreach my $key (sort keys %$hash_ref) {
+        my $value = $hash_ref->{$key};
+        $o .= "$indentation$key => ";
+        if (ref($value) eq 'HASH') {
+            $o .= "{\n";
+            $o .= dump_hash($value, $indent + 1);
+            $o .= "$indentation}\n";
+        } elsif (ref($value) eq 'ARRAY') {
+            $o .= "[\n";
+            $o .= dump_array($value, $indent + 1);
+            $o .= "$indentation]\n";
+        } else {
+            $o .= "\"$value\"\n";
+        }
+    }
+    return $o;
+}
+
+sub dump_array {
+    my ($array_ref, $indent) = @_;
+    my $o = '';
+    $indent //= 0;
+    my $indentation = " " x $indent;
+    for my $index (0 .. $#{$array_ref}) {
+        my $value = $array_ref->[$index];
+        $o .= $indentation . $index . " => ";
+        if (ref($value) eq 'HASH') {
+            $o .= "{\n";
+            $o .= dump_hash($value, $indent + 1);
+            $o .= "$indentation}\n";
+        } elsif (ref($value) eq 'ARRAY') {
+            $o .= "[\n";
+            $o .= dump_array($value, $indent + 1);
+            $o .= "$indentation]\n";
+        } else {
+            $o .= "\"$value\"\n";
+        }
+    }
+    return $o;
+}
+
+sub decode_query_result_json_string {
+    my $str = shift;
+    my $obj = JSON::Tiny::decode_json $str;
+    return $obj;
+}
+
+# Not checking valid JSON parsed against a schema right now (to detect corrupt data
+#  that still yet somehow conforms to JSON syntax)
+#
+#sub validate_object {
+# FIXME/TODO : this is only valid for TABLE queries! what about ABIs?
+# Check if supplied object returned from decode...() is invalid
+#    my $obj = shift;
+#    if (ref($obj) ne 'HASH' || !exists $obj->{rows} || ref($obj->{rows}) ne 'ARRAY') {
+#        return 0;
+#    }
+#    return 1;
+#}
+
+sub execute_player_hard_query {
+
+    # This sub is used to force a hard query to the player object.
+    # This reassures us that the API is working, the game is there, and that the player
+    #   is really registered (otherwise we will e.g. offer to regplayer).
+
+    if ($verbose) { print "Forcing a player record query to the API node.\n"; }
+
+    my $obj = get_table("hegemon.${hgm}-players", "--key-type i64 --index 2 -L$player -U$player", 0, $verbose);
+
+    if (! defined $obj) {
+        print "ERR-006: Error while querying for player record (unknown reason).\n";
+        print "\n";
+        print "Solution: Examine the result message returned from cleos for the reason.\n";
+        exit 1;
+    }
+
+    if ($verbose) {
+        print "Decoded JSON query result into Perl hash:\n";
+        $o = dump_hash($obj, 2);
+        print $o;
+    }
+
+    return $obj;
+}
+
+sub check_authorization_error {
+    my $str = shift;
+    if ($str =~ /Error 3090003: Provided keys, permissions, and delays do not satisfy declared authorizations/) {
+        print "ERR-008: DoH wallet does not have keys for account \"$player\"\n";
+        print "\n";
+        print "Solution: use the provided helper script pldoh_cleos.sh to import the needed\n";
+        print "  private key(s) into your pldoh game wallet (default.wallet file that should\n";
+        print "  be in the current directory).\n";
+        print "  Example (run the following command in the terminal to type in a private key):\n";
+        print "\n";
+        print "    pldoh_cleos.sh wallet import\n";
+        return 1;
+    }
+    return 0;
+}
+
+sub get_cache {
+    # back-end for get_table() and get_abi()
+    # arguments:
+    #   arg 1: full cleos string for hard query
+    #   arg 2: cache item (need to append $players_dir/ prefix to it)
+    #   arg 3: cache expiration (s)
+    #   arg 4: bool debug?
+    if (scalar(@_) != 4) { die "ERR-000: Internal error: get_cache() wrong number of args.\n"; }
+    my ($query_str, $cache_item, $cache_expiration_s, $debug) = @_;
+
+    # See if we have the query result as a non-expired cache entry.
+    # If we do, read it from disk and into the $jstr JSON query result string.
+    my $jstr;
+
+    # The _ is just to avoid the filesystem error that triggers with empty file names (if selector is '')
+    my $file_path = "$players_dir/$cache_item";
+
+    if (-e $file_path) {
+        my $file_stat = stat($file_path);
+        my $delta_time = time() - $file_stat->mtime;
+        if ($cache_expiration_s > 0 && $delta_time <= $cache_expiration_s) {
+
+            # Nonexpired cached query result file found; read it in
+            open(my $file, '<', $file_path) or die "Cannot open file '$file_path' for reading: $!";
+            $jstr = do { local $/; <$file> };
+            close($file);
+        } else {
+            if ($debug) {
+                print "Query cache expired for '$cache_item'\n";
+                print "  Age: $delta_time s\n";
+                print "  Max: $cache_expiration_s s\n";
+            }
+        }
+    }
+
+    # If we found it in the cache, try to parse it now.
+    # If it's not garbage, return it.
+    if (defined $jstr) {
+        my $obj = decode_query_result_json_string($jstr);
+        if (defined $obj) {
+            if ($debug) {
+                print "Query cache hit for '$cache_item'\n";
+            }
+            return $obj;
+        }
+        if ($debug) {
+            print "Query cache corrupted for '$cache_item'\n";
+        }
+        undef $jstr;
+    }
+
+    # If we didn't find it in the cache (or the cache is corrupted), make a real
+    #   query to the API.
+    if (! defined $jstr) {
+        $jstr = `$query_str`;
+        if ($? != 0) {
+            if ($debug) {
+                print "Query failed for '$cache_item'\n";
+                print "  Query: $query_str\n";
+                #print "  Output:\n$jstr\n";
+            }
+            return;    # return undef: caller will know this is an error making the query
+        } else {
+            if ($debug) {
+                print "Query succeeded for '$cache_item'\n";
+                print "  Query: $query_str\n";
+                #print "  Output:\n$jstr\n";
+            }
+        }
+    }
+
+    # Parse jstr into a new hash object and return it.
+    # If the parse is valid, store it in the cache.
+    # If it's garbage after the parse, return undef (leave retrying to the user).
+    my $obj = decode_query_result_json_string($jstr);
+    if (defined $obj) {
+
+        # Make sure the subdirectory for the cached item exists
+        my $ctpath = $file_path;
+        $ctpath =~ s|/[^/]+$||; # remove cache file name, keep path
+        if (! -e $ctpath) { mkdir $ctpath; }
+
+        # Save query result json string in the cache at file
+        #   p/playername/contractname-tablename/selector-string
+        open(my $file, '>', $file_path) or die "Cannot open file '$file_path' for writing: $!";
+        print $file $jstr;
+        close($file);
+
+    } else {
+        undef $obj;
+    }
+    return $obj;
+}
+
+sub get_table {
+    # Wholesale replacement to cleos get table for DoH.
+    #
+    # gets "selector" (what you want) out of "contractname-tablename[-scopename]" string.
+    #
+    # The selector is directly the parameters to cleos after the table name.
+    # index selector, key type, L and U, limit, etc.
+    #
+    # cache_expiration_s is optional; if not provided, it's a very long time.
+    #   it determines how many seconds until the cached query result file becomes
+    #   obsolete and a hard query to the API node is forced.
+
+    my ($contract_table, $selector, $cache_expiration_s, $debug) = @_;
+    if (!defined $contract_table || !defined $selector) {
+        print "ERR-000: Internal error (get_table() args not provided).\n";
+        exit 1;
+    }
+    if (!defined $cache_expiration_s) {
+        $cache_expiration_s = $default_get_expiration_seconds;
+    }
+
+    my $r = $contract_table =~ /^([\w.]+)-([\w.]+)(?:-([\w.]+))?$/;
+    my $contract = $1;
+    my $table = $2;
+    my $scope = $3;
+    if (! $scope) { $scope = $contract; } # if scope is ommitted, then it is the same as the contract-account name
+
+    # Command string to execute the query
+    my $query_str = "$cleos -u $api get table $contract $scope $table $selector $postfix";
+
+    # Relative cache location on disk for the result of this query
+    my $cache_item = "$player/$contract_table/_$selector";
+
+    # Run back-end code (shared with get table and get abi)
+    return get_cache($query_str, $cache_item, $cache_expiration_s, $debug);
+}
+
+sub get_abi {
+    # gets the abi for the given contract-account name string.
+    #
+    # cache_expiration_s is optional; if not provided, it's a very long time.
+    #   it determines how many seconds until the cached query result file becomes
+    #   obsolete and a hard query to the API node is forced.
+
+    my ($contract, $cache_expiration_s, $debug) = @_;
+    if (!defined $contract) {
+        print "ERR-000: Internal error (get_abi() args not provided).\n";
+        exit 1;
+    }
+    if (!defined $cache_expiration_s) {
+        $cache_expiration_s = $default_get_expiration_seconds;
+    }
+
+    # Command string to execute the query
+    my $query_str = "$cleos -u $api get abi $contract $postfix";
+
+    # Relative cache location on disk for the result of this query
+    my $cache_item = "$player/$contract/_ABI";
+
+    # Run back-end code (shared with get table and get abi)
+    return get_cache($query_str, $cache_item, $cache_expiration_s, $debug);
+}
+
+sub strip_newlines {
+    my $string = shift;
+    $string =~ s/\n/ /g;     # replace newlines with a space
+    return $string;
+}
+
+sub pack_str {
+    my $string = shift;
+    my $width = shift;
+    $string =~ s/(.{$width})/$1\n/g;    # insert newlines every $width characters
+    return $string;
+}
+
+sub pack_dump_str {   # fix a JSON dump string for printing in a small window
+    my $string = shift;
+    my $width = shift;
+    $string = strip_newlines($string);
+    if ($string eq '') {    # if empty, print that it is
+        $string = "<EMPTY>";
+    }
+    $string = pack_str($string, $width);
+    return $string;
+}
+
+sub run_batch_command {
+    my $action = shift;
+    if (! defined $action) {
+        print "ERROR: run_batch_command() called without action string.\n";
+        exit 1;
+    }
+    my $cmd = "$cleos -u $api push action hegemon.${hgm} $action -p $player $old_rpc_postfix $postfix";
+    print "Executing: $cmd\n";
+    $o = `$cmd`;
+    if ($o) {
+        print "Result:\n$o\n";
+    } else {
+        print "ERROR: unknown error attempting to execute command.\n";
+    }
+}
+
+sub run_batch_query {
+    my $index = shift;
+    my $table = shift;
+    my $scope = shift;
+    my $lo = shift;
+    if (! defined $lo) { $lo = ''; }
+    my $hi = shift;
+    if (! defined $hi) { $hi = $lo; }
+    my $lim = shift;
+    if (! defined $lim) { $lim = 100; }
+    if (!looks_like_number($lim)) {
+        print "ERROR: run_batch_query(): non-numeric query limit parameter provided: '$lim'\n";
+        exit 1;
+    }
+
+    # figure out the contract name (FIXME/TODO -- complete it and test it)
+    # if not forcing the query contract to something specific, we have to guess it from the table name
+    my $contract;
+    if ($force_query_contract eq '') {
+        if ($table eq 'blueprints' ||
+            $table eq 'effects' ||
+            $table eq 'gameassets' ||
+            $table eq 'recipes'
+            )
+        {
+            $contract = "crafting.${hgm}";
+        }
+        elsif ($table eq 'candidates' ||
+               $table eq 'voters' ||
+               $table eq 'groups' ||
+               $table eq 'proposals'
+            )
+        {
+            $contract = "politics.${hgm}";
+        }
+        elsif ($table eq 'stglobal' ||
+               $table eq 'targets' ||
+               $table eq 'stakes'
+               #|| $table eq 'accounts'    # there's an accounts table at doh-hegemon-contract, so need --contract staking.tcn to access this one
+            )
+        {
+            $contract = "staking.${tcn}";
+        }
+        else
+        {
+            $contract = "hegemon.${hgm}"; # assume it's the hegemon contract by default
+        }
+    } else {
+        $contract = $force_query_contract;
+    }
+
+    # if lower bound is not specified at all, then the query actually has no key parameters.
+    # if upper bound is '.', then there is no upper bound (query goes until the limit, setting
+    #    the "more" and "next_key" keys in the query result JSON)
+    # if upper bound is not specified, then it is the same as the lower bound (i.e. the lower
+    #    bound is actually a search for an exact key match)
+    #
+    # FIXME/TODO: when this is NOT the case, we have to either let the user specify the index to
+    #        use, or we need to test for the game tables for which this doesn't work and
+    #        adjust it accordingly.
+    #
+    my $keyopt;
+    if ($lo eq '') {
+        $keyopt = '';  # doing the default query without any key type, index or range specified
+    } elsif ($hi eq '.') {
+        $keyopt = "--key-type i64 --index $index -L$lo";
+    } else {
+        $keyopt = "--key-type i64 --index $index -L$lo -U$hi";
+    }
+
+    # compose the contract-table-[scope] argument for get_table()
+    my $contract_table = "${contract}-${table}";
+    if ($scope ne '') { # if scope specified, add the -scopename suffix that goes into get_table()
+        $contract_table = "${contract_table}-${scope}";
+    } else {
+        $scope = $contract; # this is just for the printing message below
+    }
+
+    # Run the Smart Query through the query cache and cleos and get a Perl hash with the decoded JSON
+    if (! $mute) { print "Running Smart Query, contract:'$contract' scope:'$scope' table:'$table' index:'$index' lo:'$lo' hi:'$hi' limit:'$lim'\n"; }
+    $o = get_table($contract_table, "$keyopt --limit $lim", 0); # FIXME/TODO: we have to get rid of these 0's for the cache timeout
+    if ($o) {
+        print dump_hash($o, 0);
+    } else {
+        print "ERROR: run_batch_query(): Failed to execute Smart Query for $contract $table $lo $hi.\n";
+        exit 1;
+    }
+}
+
+sub set_hgm_tcn {
+    my $value = shift;
+    if ($value == 0) { $hgm = "hgm"; $tcn = "tcn"; }
+    elsif ($value == 1) { $hgm = "hg1"; $tcn = "tc1"; }
+    elsif ($value == 2) { $hgm = "hg2"; $tcn = "tc2"; }
+    else { print "WARNING: contract variant '$value' is invalid. Ignoring.\n"; }
+    if ($verbose) { print "Contract suffixes are set to '$hgm' and '$tcn'.\n"; }
+}
+
+sub set_player {
+    $player = shift;
+    if (! valid_name($player)) {
+        print "ERR-000: Invalid account name given to --player: '$player'\n";
+        exit 1;
+    }
+    if ($verbose) { print "Player set to '$player'.\n"; }
+}
+
+sub delete_contents { # Called by File::Find functions only; callback to delete files.
+    return unless -d;
+    return if /^\.\.?$/;  # Exclude '.' and '..'
+    my $dir = File::Spec->rel2abs($_);
+    opendir my $dh, $dir or die "ERROR: Failed to open directory $dir: $!";
+    while (my $file = readdir $dh) {
+        next if $file =~ /^\.\.?$/;  # Exclude '.' and '..'
+        my $path = "$dir/$file";
+        if (-d $path) {
+            rmdir $path;  # If the subdirs inside the cache have subdirs themselves; don't care if fails
+        } elsif (substr($file, 0, 1) eq '_') {
+            unlink $path; # Only ever delete likely cache files (they all start with _)
+        }
+    }
+    rmdir $dir; # attempt to remove the root cache subdir entry itself; don't care if fails
+    closedir $dh;
+}
+
+sub purge_cache { # find every player subdirectory and wipe it clean (but retain the player subdir itself)
+    if (! $mute) { print "Purging cache subdirectory '$players_dir'.\n"; }
+    if (defined $players_dir && $players_dir ne '') {
+        opendir my $dh, $players_dir or die "ERROR: Failed to open player directory '$players_dir': $!";
+        while (my $file = readdir $dh) {
+            next if $file =~ /^\.\.?$/;  # Exclude '.' and '..'
+            my $path = "$players_dir/$file";
+            if (-d $path) { finddepth(\&delete_contents, $path); }
+        }
+        closedir $dh;
+    } else {
+        print "ERR-000: Cannot purge_cache(): $players_dir is not set.\n";
+        exit 1;
+    }
+}
+
+sub hex_distance {
+    my ($q1, $r1, $s1, $q2, $r2, $s2) = @_;
+    return (abs($q1 - $q2) + abs($r1 - $r2) + abs($s1 - $s2)) / 2;
+}
+
+sub find_shortest_path {
+    my ($src_q, $src_r, $src_s, $dst_q, $dst_r, $dst_s) = @_;
+    my @path;
+    while ($src_q != $dst_q || $src_r != $dst_r || $src_s != $dst_s) {
+        my $distance = hex_distance($src_q, $src_r, $src_s, $dst_q, $dst_r, $dst_s);
+        my @neighbors = (
+            [$src_q + 1, $src_r - 1, $src_s],
+            [$src_q + 1, $src_r, $src_s - 1],
+            [$src_q, $src_r + 1, $src_s - 1],
+            [$src_q - 1, $src_r + 1, $src_s],
+            [$src_q - 1, $src_r, $src_s + 1],
+            [$src_q, $src_r - 1, $src_s + 1]
+        );
+        my $min_distance = $distance;
+        my @min_neighbor;
+        foreach my $neighbor (@neighbors) {
+            my ($q, $r, $s) = @$neighbor;
+            my $neighbor_distance = hex_distance($q, $r, $s, $dst_q, $dst_r, $dst_s);
+            if ($neighbor_distance < $min_distance) {
+                $min_distance = $neighbor_distance;
+                @min_neighbor = ($q, $r, $s);
+            }
+        }
+        ($src_q, $src_r, $src_s) = @min_neighbor;
+        push @path, [$src_q, $src_r, $src_s];
+    }
+    return @path;
+}
+
+sub load_dm {
+    # load given contract-table string into the data model ($dm)
+    my $contract_table = shift;
+    my $key_name = shift;
+    if (! defined $contract_table || ! defined $key_name) {
+        print "ERR-000: load_dm(): missing arguments\n";
+        exit 1;
+    }
+    $dm{$contract_table} //= {};  # create dm->$contract_table hash if needed
+    my $lo = 0;
+    while (1) {
+        my $obj = $o = get_table($contract_table, "-L$lo --limit 100", $forever_seconds);
+        if (! defined $obj) {
+            print "ERR-000: load_dm(): cannot load $contract_table $lo\n";
+            exit 1;
+        }
+        # consume page of records ($obj->rows) into the data model
+        if (exists $obj->{'rows'}) {
+            # Copy the contents of $obj->{'rows'} (an array) into %dm
+            # The actual item key is in the 'id' field (mostly). The actual key is sent as
+            #   an argument to this sub to cover for cases when it conceivably could not
+            #   be named 'id'.
+            foreach my $record (@{$obj->{'rows'}}) {
+                # $record is a hash reference
+                if (exists $record->{$key_name}) {
+                    my $key_value = $record->{$key_name}; # e.g. the actual primary key value
+                    $dm{$contract_table}{$key_value} = $record;
+                } else {
+                    # if this happens, do   print dump_hash($record,0);   to see the breakage
+                    print "ERR-000: load_dm(): malformed $contract_table query answer ($key_name) $lo\n";
+                }
+            }
+        } else {
+            print "ERR-000: load_dm(): malformed $contract_table query answer (rows) $lo\n";
+            exit 1;
+        }
+        if ($verbose) { print "."; } # neato progress bar, 1 dot is --limit (100?)
+        # check more and next key
+        if (exists $obj->{more}) {
+            if ($obj->{more} != '0') {
+                if (exists $obj->{next_key}) {
+                    $lo = $obj->{next_key};
+                } else {
+                    print "ERR-000: load_dm(): malformed $contract_table query answer (next_key) $lo\n";
+                    exit 1;
+                }
+            } else {
+                last; # no more, loaded all
+            }
+        }
+    }
+}
+
+sub load_all_game_data {
+    # this sub takes no arguments. it triggers queries to a whole lot of tables (cleos get table)
+    #   and ABIs (cleos get abi) and gets a bunch of JSON objects that are stored for use by the
+    #   script. This getting is all mediated by the cleos query cache, and the cache age is
+    #   set to "a very long time". So if you want to force reload the game content, you should use
+    #   --purge-cache (which will purge other "less permanent" content too, but that's fine)
+    #
+    # do not load stuff that doesn't scale and makes no sense to load upfront ("all players",
+    #   "all characters", "all players of a faction", "all characters of a profession", etc.)
+    #
+    # some of the loaded content is irrelevant for loading upfront, e.g. the inventory on each
+    #   tile. but we do want (at least for now) to load all of the tiles to e.g. see their q,r,s
+    #   coordinates and their global tile ids.
+    # actually, tiles are a good example: in the future we may want to load upfront only the area
+    #   that the selected player is in, and load the others on demand.
+    #
+    # but we probably do want to load all e.g. recipes, blueprints, tile types, and other static
+    #   content that is used everywhere; the base game definitions.
+
+    if ($verbose) { print "Loading core game data (cache or API node). This might take a while.\n"; }
+
+    # all tables to fully load, in get_table() first argument format: contractname-tablename
+    my @tables_to_load =
+        (
+         "hegemon.${hgm}-tiles"
+         # TODO: tile types
+         # TODO: blueprints
+         # TODO: recipes
+         # TODO: factions
+        );
+
+    # load all tables
+    foreach my $contract_table (@tables_to_load) {
+        if ($verbose) { print "Loading table $contract_table: "; }
+        load_dm($contract_table, $id_key);
+        if ($verbose) { print "\n  Loaded " . scalar(%{$dm{$contract_table}}) . " objects.\n"; }
+    }
+
+    # load ABI of all game contracts we know of
+    my @contracts_to_load_abi =
+        (
+         "hegemon.${hgm}",
+         "politics.${hgm}",
+         "crafting.${hgm}",
+         "names.${hgm}",
+         "staking.${tcn}"
+        );
+
+    # load all tables
+    foreach my $contract (@contracts_to_load_abi) {
+        if ($verbose) { print "Loading ABI for $contract..."; }
+
+        $abis{$contract} = get_abi($contract, $forever_seconds, 0);
+
+        if ($verbose) { print "OK.\n"; }
+    }
+}
+
+# --------------------------------------------------------------------------------------------
+# Parse command-line arguments
+# --------------------------------------------------------------------------------------------
+
+# Command-line argument parsing does not trigger any work. It just changes configuration
+#   options and stacks work items that will be dealt with later.
+
+# General
+my $opt_help;
+my @opt_abi;
+my $opt_batch;
+my $opt_mute;
+my @opt_player;
+my $opt_purge_cache;
+my @opt_route;
+my $opt_verbose;
+my @opt_tcn;
+my @opt_cleos;
+my @opt_cleostx;
+
+# Queries
+my @opt_contract;
+my @opt_query;
+my @opt_squery;
+my @opt_players; # since --query does everything (or /should/ be able to do everything, as far as we know), it's questionable whether we need specialized query commands like --players [pagenum]; --players might be removed in the future.
+
+# Player cmds
+my $opt_createchar;
+my @opt_detokenize;
+my @opt_dodropoff;
+my @opt_doload;
+my @opt_domove;
+my @opt_dopickup;
+my @opt_dounload;
+my @opt_joinfaction;
+# regplayer is always dealt with interactively, before we execute any batch commands
+my @opt_tokenize;
+
+# Char cmds
+# calcenergy -- not sure if and when we need this and how to use it
+# discardchar -- doesn't seem implemented yet
+my @opt_doaddmats;
+my @opt_doaddproj;
+my @opt_dobuild;
+my @opt_docancelproj;
+my @opt_docivil;
+my @opt_docommerce;
+my @opt_docraft;
+my @opt_dodisembark;
+my @opt_doeat;
+my @opt_doembark;
+my @opt_doeng;
+my @opt_doequip;
+my @opt_dofarming;
+my @opt_dohealth;
+my @opt_dointel;
+my @opt_dologis;
+my @opt_domilitary;
+my @opt_domining;
+my @opt_doresearch;
+my @opt_dounequip;
+# killchar -- require_auth(self)
+my @opt_revivechar;
+# update -- doesn't seem implemented yet
+my @opt_upgradechar;
+
+# Define command-line options
+GetOptions(
+    # General options
+    'help|h'            => \$opt_help,
+    'abi=s{1,2}'        => \@opt_abi,           # fullcontractname|'all', abi-item/key-name
+    'batch|b'           => \$opt_batch,
+    'mute|m'            => \$opt_mute,
+    'player|p'          => \@opt_player,        # playername
+    'purge-cache'       => \$opt_purge_cache,
+    'route=s{1}'        => \@opt_route,         # destination-tile-id
+    'verbose|v'         => \$opt_verbose,
+    'tcn=s{1}'          => \@opt_tcn,           # [0,1,2]
+    'cleostx=s{1}'      => \@opt_cleostx,       # "full cleos params string"
+    'cleos=s{1}'        => \@opt_cleos,         # "full cleos params string"
+
+    # Table queries
+    'contract=s{1}'     => \@opt_contract,      # full contract name (with prefix and suffix, e.g. "hegemon.hgm")
+    'q|query=s{1,5}'    => \@opt_query,         # [index=1] table [lower] [upper] [limit]
+    's|squery=s{2,6}'   => \@opt_squery,        # [index=1] table scope [lower] [upper] [limit]
+    'players:s'         => \@opt_players,       # [player table page number (first=0)]
+
+    # Player commands (player argument is implicitly selected by pldoh, in both interactive and batch mode)
+    'createchar'        => \$opt_createchar,    # <void>
+    'detokenize=s{1}'   => \@opt_detokenize,    # asset (string e.g. "4.9542 FOOD")
+    'dodropoff=s{2}'    => \@opt_dodropoff,     # item-quantity, item-type
+    'doload=s{3}'       => \@opt_doload,        # vehicle-id, item-quantity, item-type
+    'domove=s{1}'       => \@opt_domove,        # tile-id
+    'dopickup=s{2}'     => \@opt_dopickup,      # item-quantity, item-type
+    'dounload=s{3}'     => \@opt_dounload,      # vehicle-id, item-quantity, item-type
+    'joinfaction=s{1}'  => \@opt_joinfaction,   # faction-id
+    'tokenize=s{1}'     => \@opt_tokenize,      # asset (string e.g. "0.1200 CRYOPOD")
+
+    # Character commands (there is no "currently selected character" in batch mode)
+    'doaddmats=s{4}'    => \@opt_doaddmats,     # character-id, project-id, item-quantity, item-type
+    'doaddproj=s{2}'    => \@opt_doaddproj,     # character-id, blueprint-id
+    'dobuild=s{2}'      => \@opt_dobuild,       # character-id, project-id
+    'docancelproj=s{2}' => \@opt_docancelproj,  # character-id, project-id
+    'docivil=s{1}'      => \@opt_docivil,       # character-id
+    'docommerce=s{1}'   => \@opt_docommerce,    # character-id
+    'docraft=s{2}'      => \@opt_docraft,       # character-id, recipe-id
+    'dodisembark=s{1}'  => \@opt_dodisembark,   # character-id
+    'doeat=s{1}'        => \@opt_doeat,         # character-id
+    'doembark=s{2}'     => \@opt_doembark,      # character-id, vehicle-id
+    'doeng=s{1}'        => \@opt_doeng,         # character-id
+    'doequip=s{2}'      => \@opt_doequip,       # character-id, gameasset-id
+    'dofarming=s{1}'    => \@opt_dofarming,     # character-id
+    'dohealth=s{1}'     => \@opt_dohealth,      # character-id
+    'dointel=s{1}'      => \@opt_dointel,       # character-id
+    'dologis=s{1}'      => \@opt_dologis,       # character-id
+    'domilitary=s{1}'   => \@opt_domilitary,    # character-id
+    'domining=s{1}'     => \@opt_domining,      # character-id
+    'doresearch=s{1}'   => \@opt_doresearch,    # character-id
+    'dounequip=s{2}'    => \@opt_dounequip,     # character-id, gameasset-id
+    'revivechar=s{1}'   => \@opt_revivechar,    # character-id  (+current player is the payer)
+    'upgradechar=s{2}'  => \@opt_upgradechar    # character-id, new-role-id
+
+) or die "ERR-999: Error in command line arguments\n";
+
+# When an options with optional arg e.g. --players [n] is not specified at all, the array is empty
+#   instead of the array variable remaining undefined.
+# What we want is for the array to be undefined, like the other ones (e.g. dropoff=s{2}) but unfortunately
+#   =s{2} and :s work differently, so fix the :s case to make it consistent with e.g. =s{2}.
+
+if (scalar(@opt_players) == 0) { undef @opt_players; }
+
+# Here, print help and exit, or print the startup banner, before we start printing
+#   the results of command-line processing.
+
+if ($opt_help) {
+    print "\n";
+    print "pldoh (perl client for Dynamics of Hegemony)\n";
+    print "\n";
+    print "If no options given, run in interactive (menu/player) mode, and verbose mode.\n";
+    print "Command-line overrides config file '$pldoh_config', which overrides defaults.\n";
+    print "\n";
+    print "Usage:\n";
+    print "  pldoh [OPTIONS]\n";
+    print "\n";
+    print "General options:\n";
+    print "  --abi <c> [s]        Print ABI of contract c or specifics of item s of c; if c\n";
+    print "                       is 'all', process all contracts; if s is omitted, prints a\n";
+    print "                       short summary of contract(s); if s is '.', match everything\n";
+    print "  --batch, -b          Non-interactive mode: process all supplied options and exit\n";
+    print "  --help, -h           Print this help and exit\n";
+    print "  --mute, -m           Suppress some important messages (e.g. wallet unlocking) for\n";
+    print "                       easier reading; will not suppress errors or (most) prompts\n";
+    print "  --player, -p <name>  Select player to play with (blockchain account name)\n";
+    print "  --purge-cache        Clear players data dir cache (default: './$players_dir/')\n";
+    print "  --verbose, -v        Force verbose mode (for when it is disabled by batch mode)\n";
+    print "\n";
+    print "General options for development/debugging (temporary -- do not rely on these):\n";
+    print "  --tcn <v>            v=0: hgm/tcn; v=1: hg1/tc1; v=2: hg2/tc2\n";
+    print "  --cleostx <cmd>      Pass send-transaction <cmd> string to cleos\n";
+    print "  --cleos <cmd>        Pass non-transaction <cmd> string to cleos (NOTE: pldoh adds\n";
+    print "                       --wallet-url, -u, -p, -t & --use-old-send-rpc cleos options)\n";
+    print "\n";
+    print "Queries:\n";
+    print "  --contract <c>              Contract for query (with suffix e.g. \"hegemon.hgm\")\n";
+    print "                              If not specified, pldoh will attempt to guess it\n";
+    print "  --query, -q [i] <t> [L] [U] [n]  Run a Smart Query (queries any game table)\n";
+    print "      [i]    If first argument is numeric: table index to use (default is 1)\n";
+    print "      <t>    Smart Query table name (e.g. \"players\"; contract/scope is guessed)\n";
+    print "      [L]    Lower bound key value to return (e.g. \"15\", or \"myplayeracct\")\n";
+    print "             (if neither L or U specified, will query from the first item of the\n";
+    print "              primary index, and iterate to return up to [limit] records)\n";
+    print "      [U]    Upper bound key value to return; if '.', no upper bound; if ommitted,\n";
+    print "             then the upper bound will be the same as lower bound (exact match)\n";
+    print "      [n]    Max number of records to return, default=100 (cleos '--limit' option)\n";
+    print "  --squery, -s [i] <t> <s> [L] [U] [n]   Run Smart Query using contract scope s\n";
+    print "  --players <n>               Get page <n> of players (n >= 0); 100 per page\n";
+    print "\n";
+    print "Player commands:\n";
+    print "  --createchar                Attempt to spawn a new character (costs 1 CRYOPOD)\n";
+    print "  --detokenize <asset>        Blockchain asset (e.g. \"5.5000 FOOD\") to inventory\n";
+    print "  --dodropoff <q> <i>         Drop quantity q of item i\n";
+    print "  --doload <v> <i> <q>        Load quantity q of item i into vehicle v\n";
+    print "  --domove <t>                Move to tile id t\n";
+    print "  --dopickup <q> <i>          Pick up quantity q of item i\n";
+    print "  --dounload <v> <i> <q>      Unload quantity q of item i from vehicle v\n";
+    print "  --joinfaction <f>           Join faction id f\n";
+    print "  --tokenize <asset>          Inventory asset (e.g. \"2.1470 TOOL\") to blockchain\n";
+    print "\n";
+    print "Character commands:\n";
+    print "  --doaddmats <c> <p> <q> <i> Char c adds quantity q of item i to project p\n";
+    print "  --doaddproj <c> <b>         Char c creates a new project using blueprint-id b\n";
+    print "  --dobuild <c> <p>           Char c spends energy assembling project p\n";
+    print "  --docancelproj <c> <p>      Char c destroys project p\n";
+    print "  --docivil <c> <p>           Char c produces CONTROL\n";
+    print "  --docommerce <c> <p>        Char c produces ECONOMY\n";
+    print "  --docraft <c> <r>           Char c crafts item using crafting recipe r\n";
+    print "  --dodisembark <c>           Char c disembarks from the vehicle it is in\n";
+    print "  --doeat <c>                 Char c consumes 1 FOOD\n";
+    print "  --doembark <c> <v>          Char c embarks on vehicle id v\n";
+    print "  --doeng <c>                 Char c produces TOOL\n";
+    print "  --doequip <c> <g>           Char c equips gameasset id g\n";
+    print "  --dofarming <c>             Char c produces FOOD\n";
+    print "  --dohealth <c>              Char c produces CLONE\n";
+    print "  --dointel <c>               Char c produces SPIES\n";
+    print "  --dologis <c>               Char c produces CRYOPOD\n";
+    print "  --domilitary <c>            Char c produces TROOPS\n";
+    print "  --domining <c>              Char c produces MINERAL\n";
+    print "  --doresearch <c>            Char c produces SCIENCE\n";
+    print "  --dounequip <c> <g>         Char c unequips gameasset id g\n";
+    print "  --revivechar <c>            Revive char c (costs 1 CLONE)\n";
+    print "  --upgradechar <c> <r>       Upgrade char c to role id r\n";
+    print "\n";
+    exit 1;
+}
+
+# If any intrinsically batch job or flag is provided (game query, game command, ...) we force batch mode.
+# If any option that sends transactions is called, we set txsign to 1
+
+if (@opt_abi || $opt_batch || @opt_route
+    || @opt_query || @opt_squery || @opt_players
+    )
+{
+    $menu = 0;
+}
+
+if (@opt_cleos || @opt_cleostx   # will potentially need it, so just require it, to simplify (dev options anyway)
+    || $opt_createchar || @opt_detokenize || @opt_dodropoff || @opt_doload || @opt_domove || @opt_dopickup || @opt_dounload || @opt_joinfaction || @opt_tokenize
+    || @opt_doaddmats || @opt_doaddproj || @opt_dobuild || @opt_docancelproj || @opt_docivil || @opt_docommerce || @opt_docraft || @opt_dodisembark || @opt_doeat || @opt_doembark || @opt_doeng || @opt_doequip || @opt_dofarming || @opt_dohealth || @opt_dointel || @opt_dologis || @opt_domilitary || @opt_domining || @opt_doresearch || @opt_dounequip || @opt_revivechar || @opt_upgradechar
+   )
+{
+    $menu = 0;
+    $txsign = 1;
+}
+
+# If not in menu mode, disable verbose mode
+if ($menu == 0) { $verbose = 0; }
+
+# But if -v is used, verbose mode is forced
+if ($opt_verbose) { $verbose = 1; }
+
+# But if -m is used (the most forceful flag, for those who know what they are doing), then we cannot be in verbose mode
+if ($opt_mute) { $mute = 1; $verbose = 0; }
+
+# Say hello
+if ($verbose) {
+    print "\n--------------------------------------------------------------------------------\npldoh\n--------------------------------------------------------------------------------\n\n";
+    print "current directory: $RealBin\n";
+    print "cleos prefix: $cleos\n";
+
+    if ($menu == 0) {
+        if ($verbose) { print "Switching to batch mode\n"; }
+    }
+    if ($opt_verbose) {
+        print "Forcing verbose mode\n";
+    }
+    if ($menu == 0 && $need_auth_check == 1) {
+        if ($verbose) { print "Turning off need-auto-check since batch mode is enabled\n"; }
+        $need_auth_check = 0;
+    }
+    if ($menu == 1) {
+        $txsign = 1;
+    }
+}
+
+if ($txsign == 1) {
+    if ($verbose) { print "Transaction signing (i.e. try wallet unlock, etc.) is enabled\n"; }
+    # don't need to check whether we need to enable need_auto_check here, because we will figure
+    #  it out naturally.
+}
+
+# Deal with --tcn dev option now
+if (@opt_tcn) { set_hgm_tcn($opt_tcn[0]); }
+
+# Deal with --player option now, since it is one of the first things that are resolved
+if (@opt_player) { set_player($opt_player[0]); }
+
+# Deal with --purge-cache now, since it affects reading objects and such
+if ($opt_purge_cache) { purge_cache(); }
+
+# --------------------------------------------------------------------------------------------
+# Resolve cleos and keosd
+# --------------------------------------------------------------------------------------------
+
+my $no_client = 0;
+
+# Check if cleos and keosd exist in the system's PATH
+$o = `which cleos`;
+if ($? != 0) {
+    print "cleos not found in the system's PATH.\n";
+    $no_client = 1;
+} else {
+    if ($verbose) { print "cleos found: $o"; }
+}
+
+$o = `which keosd`;
+if ($? != 0) {
+    print "keosd not found in the system's PATH.\n";
+    $no_client = 1;
+} else {
+    if ($verbose) { print "keosd found: $o"; }
+}
+
+if ($no_client) {
+    print "\n";
+    print "ERR-012: Cannot find wallet back-end programs.\n";
+    print "\n";
+    print "pldoh is a front-end to cleos and keosd. You must install both cleos and keosd\n";
+    print "  in your system first.\n";
+    print "Visit https://github.com/AntelopeIO/leap/releases/, download and install a leap\n";
+    print "  distribution. That will put a copy of the cleos and keosd executables in a\n";
+    print "  directory that's in your PATH (usually under /usr/bin/).\n";
+    print "Alternatively, you can extract the cleos and keosd binaries from the .deb (since\n";
+    print "  a .deb file is just an archive file) and place them in the same directory as\n";
+    print "  pldoh, which will find and use them.\n";
+    exit 1;
+}
+
+# Try to start keosd as a child process. The wallet directory is the current directory, and
+#   keosd.sock is also written in the current directory. This ensures pldoh will use its own
+#   wallet file for playing the game, with its own password and its own security discipline.
+# This allows game players to separate their game accounts from their other accounts that
+#   they may hold in e.g. the default wallet file that's created at the default location.
+# We could use cleos wallet open -n <walletname> but it's better to use the default.wallet
+#   in a predictable and separate location (i.e. the game client's own directory) which
+#   removes the risk of the user connecting to their main wallet file, which we don't want.
+# If keosd fails, it is probably because it is already running, i.e. there's already a lock
+#   in the current directory (wallet.lock). Which means we don't need to start it again
+#   anyways. The new attempted run will pollute the same log file (keosd.log), but that's
+#   fine.
+my $pid = fork();
+die "Failed to fork: $!" unless defined $pid;
+
+if ($pid) {
+    if ($verbose) {
+        print "Trying to start keosd in a child process (log file: $keosd_log).\n";
+        print "keosd's wallet directory will be pldoh's current directory.\n";
+    }
+    sleep(0.2); # give keosd some time to start up
+} else {
+    # Run keosd while redirecting all of its output to keosd.log
+    if (open(STDOUT, '>>', $keosd_log)) {
+        open(STDERR, '>>&', \*STDOUT);
+        my $keosd_cmd = "keosd --wallet-dir \"$RealBin\" --data-dir \"$RealBin\"";
+        if ($verbose) { print "Running keosd with: $keosd_cmd\n"; }
+        $o = `$keosd_cmd`;
+        if ($? != 0) {
+            my $exit_code = $? >> 8;
+            my $error_message = strerror($exit_code);
+            print "Command failed with exit code $exit_code: $error_message\n";
+        }
+        close(STDOUT);
+    } else {
+        die "ERR-000: Cannot try to run keosd: failed to redirect STDOUT: $!";
+    }
+    exit;
+}
+
+# Try to open the wallet
+
+if ($verbose) { print "Opening $RealBin/default.wallet\n"; }
+
+$o = `$cleos wallet open $postfix`;
+if ($? != 0) {
+    if ($o =~ /Error 3120002: Nonexistent wallet/) {
+        print "ERR-001: Can't open wallet; default.wallet file doesn't exist.\n";
+        print "\n";
+        print "Solution: create your DoH wallet first using the command below:\n";
+        print "  $cleos wallet create --to-console\n";
+    } elsif ($o =~ /Failed http request to keosd/) {
+        print "ERR-002: Can't open wallet; cannot connect to keosd.\n";
+        print "\n";
+        print "Solution: try again and/or file a bug ticket.\n";
+    } else {
+        print "Result: $o\n";
+        print "ERR-003: Can't open wallet (unknown reason).\n";
+    }
+    exit 1;
+}
+
+if ($verbose) { print $o; } # "Opened: default"
+
+# If pldoh_unlock.sh does not exist, write it
+
+if (! -e $pldoh_unlock_sh) {
+    open(my $fh, '>', $pldoh_unlock_sh) or die "Cannot open file $pldoh_unlock_sh for writing: $!";
+    print $fh "#!/bin/sh\n";
+    print $fh "\n";
+    print $fh "# pldoh wallet unlock script\n";
+    print $fh "# This script is called by pldoh whenver it attempts to unlock the user's DoH wallet file.\n";
+    print $fh "# You can add --password=xxxx to avoid having to type the password to unlock the wallet.\n";
+    print $fh "#   (If you do so, be aware that your wallet will be immediately compromised if an attacker\n";
+    print $fh "#    gains access to your machine!)\n";
+    print $fh "\n";
+    print $fh "$cleos wallet unlock\n";
+    close($fh);
+    chmod 0755, $pldoh_unlock_sh;
+    if (! $mute) { print "Created wallet unlock script: $pldoh_unlock_sh\n"; }
+} else {
+    if ($verbose) { print "Already generated: $pldoh_unlock_sh (wallet unlock script)\n"; }
+}
+
+# if pldoh_cleos.sh does not exist, write it
+
+if (! -e $pldoh_cleos_sh) {
+    open(my $fh, '>', $pldoh_cleos_sh) or die "Cannot open file $pldoh_cleos_sh for writing: $!";
+    print $fh "#!/bin/sh\n";
+    print $fh "\n";
+    print $fh "# pldoh cleos helper script (auto-generated by pldoh)\n";
+    print $fh "# This script adds the correct --wallet-url argument to cleos. It will point to\n";
+    print $fh "#   the current directory as the wallet directory.\n";
+    print $fh "# This script doesn't work if you change the location of pldoh. In that case, just\n";
+    print $fh "#   delete this script and pldoh will recreate it.\n";
+    print $fh "# The \$* at the end is replaced by the arguments you are passing to this script.\n";
+    print $fh "\n";
+    print $fh "$cleos \$*\n";
+    close($fh);
+    chmod 0755, $pldoh_cleos_sh;
+    if (! $mute) { print "Created cleos script: $pldoh_cleos_sh\n"; }
+} else {
+    if ($verbose) { print "Already generated: $pldoh_cleos_sh (cleos invocation helper script)\n"; }
+}
+
+# --------------------------------------------------------------------------------------------
+# Open and parse global pldoh.cfg config file (if it exists)
+# --------------------------------------------------------------------------------------------
+
+# Now that we have cleos/keosd figured out, open and parse the pldoh global config file.
+# This will determine the blockchain API node URL to use, among other parameters.
+# Do not check for necessary parameters defined here, since they could also be provided
+#   via command-line arguments or hard-coded. Check for configuration when it is used.
+
+# Write default config file if there isn't one
+
+if (! -e $pldoh_config) {
+    if (! $mute) { print "Writing default configuration file to $pldoh_config\n"; }
+    open(my $fh, '>', $pldoh_config) or die "Cannot open file $pldoh_config for writing: $!";
+    print $fh "# pldoh configuration file\n";
+    print $fh "\n";
+    print $fh "$chain_name_key = UX Network Private Testnet\n";
+    print $fh "$chain_api_key = https://uxnetd.goldenplatform.com\n";
+    close($fh);
+}
+
+# Read config file
+
+if ($verbose) { print "Reading configuration file $pldoh_config\n"; }
+
+my %config;
+
+open(my $fh, '<', $pldoh_config) or die "Failed to open file '$pldoh_config': $!";
+while (my $line = <$fh>) {
+    chomp $line;
+    next if $line =~ /^\s*$/;  # Skip empty lines
+    next if $line =~ /^\s*#/;  # Skip comment lines
+    my ($key, $value) = split(/\s*=\s*/, $line, 2);
+    next unless defined $key && defined $value;
+    $config{$key} = $value;
+    if ($verbose) { print "  $key = $value\n"; }
+
+    # Act on certain keys when they are read
+
+    if ($key eq $player_key) {
+        if ($player ne '') {
+            if ($verbose) { print "    Player already set via --player; ignoring.\n"; }
+        } else {
+            set_player($value);
+        }
+    }
+
+    if ($key eq $chain_api_key) {
+        $api = $value;
+        if ($verbose) { print "    API node set to $api\n"; }
+    }
+
+    if ($key eq $need_auth_check_key) {
+        $need_auth_check = $value;
+    }
+
+    if ($key eq $tcn_key) {
+        set_hgm_tcn($value);
+    }
+}
+close($fh);
+
+# --------------------------------------------------------------------------------------------
+# Resolve player list from player data directories & select player (account) to play with
+# --------------------------------------------------------------------------------------------
+
+# "player" refers to both the account name that owns a player record, and the player record
+#   with its $id_key ('id') primary key. They are conceptually the same since the hegemon
+#   contract does not allow a blockchain account to be the owner of more than one player
+#   record / global entity id.
+
+# Check if data directory for all known player accounts exists, create if not
+unless (-d $players_dir) {
+    mkdir $players_dir or die "Failed to create player store ./$players_dir: $!";
+    if (! $mute) { print "Created player store: $RealBin/$players_dir\n"; }
+} else {
+    if ($verbose) { print "Found player store: $RealBin/$players_dir\n"; }
+}
+
+# Scan subdirectory names (all player names we are playing with)
+opendir my $dh, $players_dir or die "Failed to open directory $players_dir: $!";
+my @players = grep { -d File::Spec->catdir($players_dir, $_) && !/^\./ } readdir $dh;
+closedir $dh;
+
+# Resolve/select player name and player data dir
+if (scalar(@players) == 0) {
+
+    my $player_input = $player eq '';
+
+    # if default player name not provided, ask for it
+    if ($player_input) {
+
+        check_interactive_player_selection_enabled();
+
+        print "\n";
+        print "In DoH, your blockchain account name (12 characters, a-z 1-5) is your player\n";
+        print "  name and player identity. Please enter the name of the blockchain account\n";
+        print "  that you will be playing with.\n";
+        print "\n";
+        print "Blockchain account name: ";
+        $player = <STDIN>;
+        chomp($player);
+    }
+
+    # Validate player name
+    validate_selected_player_name();
+
+    # Append player selection to config file if we gone to the trouble of typing it up
+    if ($player_input) {
+        save_selected_player_to_config();
+    }
+
+    $player_data_dir = "$players_dir/$player";
+
+    mkdir $player_data_dir or die "Failed to create directory $player_data_dir: $!";
+
+    print "Created player data directory: $player_data_dir\n";
+
+} else {
+
+    # Print the array of subdirectory names
+    if ($verbose) {
+        print "Found the following player data directories:\n";
+        print join("\n", @players);
+        print "\n";
+    }
+
+    if (scalar(@players) == 1) {
+
+        # if it's the same as the already set $player (pldoh.ini or --player), then don't print anything.
+        if ($player ne $players[0]) {
+
+            my $player_was_unset = ($player eq '');
+
+            # If only one player dir found, just select it.
+            $player = $players[0];
+            if (! $mute) { print "Auto-selecting player: $player\n"; }
+
+            # Save the player selection to pldoh.ini if it was not explicitly configured
+            #   to be something by the user already.
+            if ($player_was_unset) {
+                # This should be not needed, generally; if it has a directory, then it's probably valid.
+                # But since we are going to write this down in the pldoh.ini file, then why not check?
+                validate_selected_player_name();
+
+                save_selected_player_to_config();
+            }
+        }
+
+        $player_data_dir = "$players_dir/$player";
+
+    } else {
+
+        # If selected player (if any) does not have a directory in @players
+        #   then need to show a menu and ask which player to use.
+
+        #if ($player ~~ @players) {
+        if (grep { $_ eq $player } @players) {
+            if ($verbose) { print "Previously-selected player $player is valid; already has its data directory.\n"; }
+        } else {
+            if ($player ne '') {
+                print "ERR-041: Previously-selected player $player is invalid as it does not have a data directory.\n";
+                print "\n";
+                print "Solution 1: create directory $RealBin/$players_dir/$player\n";
+                print "Solution 2: Do not select a player name (check $pldoh_config and\n";
+                print "  your command-line arguments for a player name selection.)\n";
+                exit 1;
+            }
+
+            check_interactive_player_selection_enabled();
+
+            # Show menu to select player name
+            print "Select a player:\n";
+            my $pnum = scalar @players;
+            for (my $i = 0; $i < $pnum; $i++) {
+                print "[" . ($i + 1) . "] $players[$i]\n";
+            }
+
+            print "Enter the player number [1..$pnum]: ";
+            my $selection = <STDIN>;
+            chomp($selection);
+
+            if ($selection =~ /^\d+$/ && $selection >= 1 && $selection <= $pnum) {
+                $player = $players[$selection - 1];
+                print "Selected player name: $player\n";
+            } else {
+                print "ERR-042: Invalid player name menu selection.\n";
+                exit 1;
+            }
+
+            validate_selected_player_name();
+            save_selected_player_to_config();
+        }
+    }
+
+    $player_data_dir = "$players_dir/$player";
+}
+
+if ($verbose) { print "Player data directory: $RealBin/$player_data_dir\n"; }
+
+# --------------------------------------------------------------------------------------------
+# Unlock the wallet
+# --------------------------------------------------------------------------------------------
+
+# If it's guaranteed that we won't need to sign transactions in this session, then we don't
+#    need to unlock the wallet.
+if ($txsign) {
+
+    # This is all printed even if not verbose mode, since wallet unlocking is sensitive and,
+    #   potentially, interactive (you may have to type the wallet passwod).
+
+    # At this point, we have done everything that we had to do before we need the wallet to be
+    #   unlocked, so (if necessary) we will ask the user to type the wallet password to unlock it.
+
+    if (! $mute) {
+        print "Will now attempt to unlock the wallet by running $pldoh_unlock_sh\n";
+        print "If the wallet is locked, you may have to enter your wallet password:\n";
+
+        # FIXME/TODO: if we want to be perfectionists here, we can grep the pldoh_unlock.sh
+        #             script to see if it has a --password=xxxx parameter in the cleos call.
+        #             if it does not, AND the wallet is locked, THEN we do print the
+        #             password: prompt, even if in mute mode.
+        #
+        print "password: "; # cheat by emulating the wallet password prompt
+    }
+
+    $o = `$pldoh_unlock_sh $postfix`;
+
+    if (! $mute) {
+        print "\n";         # continue cheating
+    }
+
+    if ($? != 0) {
+        if ($o =~ /Error 3120005: Invalid wallet password/) {
+            print "ERR-004: Error while trying to unlock wallet; provided wallet password is invalid.\n";
+        } else {
+            print "Result: $o\n";
+            print "ERR-005: Error while trying to unlock wallet (unknown reason).\n";
+        }
+        exit 1;
+    }
+
+    if (! $mute) {
+        print $o; # prints "Unlocked: default"
+    }
+}
+
+# --------------------------------------------------------------------------------------------
+# Check that we have the API URL set somehow, since we will be using it going forward
+# --------------------------------------------------------------------------------------------
+
+if ($api eq '') {
+    print "ERR-020: chain API node not set.\n";
+    print "\n";
+    print "Solution: edit $pldoh_config and add a chain-api entry with the URL\n";
+    print "  of the chain API node to use, or provide it via a command-line arg.\n";
+    exit 1;
+}
+
+# --------------------------------------------------------------------------------------------
+# In interactive (menu) mode, test API and offer to regplayer if necessary
+# --------------------------------------------------------------------------------------------
+
+# Interactive (menu) mode only.
+#
+# This is the only hard query we make; all others will be mediated by the table cache.
+# In interactive mode, we want to test the API node before we start asking for passwords etc.
+#   and hard fetching the registered player game-object for the selected blockchain account
+#   is a good way to do it.
+# This also allows us to detect that the blockchain account isn't regplayer'ed and offer to
+#   do that for the user.
+
+if ($menu) {
+
+    my $obj = execute_player_hard_query();
+
+    if ($verbose) { print "Access to the DoH blockchain back-end seems in order.\n"; }
+
+    # Validate result; check if need to regplayer
+
+    my $row_count = scalar @{$obj->{rows}};
+
+    if ($row_count >= 2) {
+        print "ERR-009: Multiple rows returned by a player table query (zero or one expected).\n";
+        exit 1;
+    } elsif ($row_count == 1) {
+        # All good: player's blockchain account has called regplayer.
+        # Found one player object with $player account as its owner.
+        if ($verbose) { print "One player record found (player seems to be registered).\n"; }
+    } elsif ($row_count == 0) {
+
+        # Need to regplayer. Offer to do it for the user.
+        # All this is printed since it's falling back into interactivity (ignore $verbose==0/$menu==0)
+
+        print "\n";
+        print "Selected blockchain account '$player' is not registered in DoH as a game player.\n";
+        print "\n";
+        print "To be able to continue and play the game, the account must register as a player.\n";
+        print "If you do not want to register now, just press CTRL+C to exit pldoh, kill -9 the\n";
+        print "  process ID, or close the terminal window.\n";
+        print "\n";
+        print "If you want to register your account as a player now, please select below whether\n";
+        print "  you want to opt in or opt out of DoH politics (i.e. the Squad game).\n";
+        print "\n";
+        print "Player registration option:\n";
+        print "[1] Yes, play politics (opt in to politics)\n";
+        print "[2] No politics (opt out of politics)\n";
+        print "\n";
+        print "Enter the desired option: ";
+        my $selection = <STDIN>;
+        chomp($selection);
+        if ($selection =~ /^\d+$/ && $selection >= 1 && $selection <= 2) {
+            my $oopbool;
+            if ($selection == 1) {
+                $oopbool = "false";  # opt in, i.e. DON'T opt out
+            } else {
+                $oopbool = "true";   # DON'T opt in, i.e. opt out
+            }
+            print "Selected politics option: $selection ($oopbool)\n";
+
+            # Attempt to regplayer
+
+            my $regplayer_cmd = "$cleos -u $api push action hegemon.${hgm} regplayer '{\"player\":\"$player\", \"opt_out_of_politics\":$oopbool}' -p $player $old_rpc_postfix $postfix";
+            print "Command: $regplayer_cmd\n";
+            $o = `$regplayer_cmd`;
+            if ($? != 0) {
+                if (! check_authorization_error($o)) {
+                    print "Result: $o\n";
+                    print "ERR-010: Can't regplayer (unknown reason).\n";
+                }
+                exit 1;
+            }
+
+            print "Player registration request command submitted. Querying player table to check if it's all right.";
+
+            $obj = execute_player_hard_query();
+
+            $row_count = scalar @{$obj->{rows}};
+
+            if ($row_count >= 2) {
+                print "ERR-009: Multiple rows returned by a player table query (zero or one expected).\n";
+                exit 1;
+            } elsif ($row_count == 1) {
+                # regplayer counts as an auth check
+                $need_auth_check = 0;
+                # All good: player's blockchain account has called regplayer.
+                # Found one player object with $player account as its owner.
+                print "One player record found (player seems to be registered).\n";
+            } elsif ($row_count == 0) {
+                print "ERR-011: No player record found; regplayer seems to have failed.\n";
+                exit 1;
+            }
+
+        } else {
+            print "ERR-043: Invalid politics menu selection.\n";
+            exit 1;
+        }
+
+    } else {
+        print "ERR-000: Never happens.\n";
+        exit 1;
+    }
+
+    if ($need_auth_check) {
+
+        # Attempt a dummy token transfer (fails anyway).
+        # If the reported error is an authorization error, stop and instruct user to
+        #   import the wallet keys for $player.
+
+        if ($verbose) { print "Interactive mode: ensuring authorization for '$player'\n"; }
+
+        my $dummy_cmd = "$cleos -u $api push action eosio.token transfer '{\"from\":\"$player\", \"to\":\"$player\", \"quantity\":\"0.0000 DUMMY\", \"memo\":\"\"}' -p $player $old_rpc_postfix $postfix";
+
+        $o = `$dummy_cmd`;
+        if (check_authorization_error($o)) {
+            exit 1;
+        }
+    }
+}
+
+# --------------------------------------------------------------------------------------------
+# Load all game data (from API node if first time, or the cache)
+# --------------------------------------------------------------------------------------------
+
+load_all_game_data();
+
+# --------------------------------------------------------------------------------------------
+# Carry out non-interactive tasks instructed by command-line options
+# --------------------------------------------------------------------------------------------
+
+# Cleos passthroughs
+
+if (@opt_cleostx) {
+    my $query_str = "$cleos -u $api " . $opt_cleostx[0] . " -p $player $old_rpc_postfix $postfix";
+    if (! $mute) { print "Executing cleos (tx): $query_str\n"; }
+    $o = `$query_str`;
+    if ($? != 0) {
+        if (! $mute) {
+            print "ERROR: cleos (tx): $!\n";
+            print "Output:\n";
+        }
+    } else {
+        if (! $mute) {
+            print "cleos (tx) finished successfully.\n";
+            print "Output:\n";
+        }
+    }
+    print $o;
+}
+
+if (@opt_cleos) {
+    my $query_str = "$cleos -u $api " . $opt_cleos[0] . " $postfix";
+    if (! $mute) { print "Executing cleos: $query_str\n"; }
+    $o = `$query_str`;
+    if ($? != 0) {
+        if (! $mute) {
+            print "ERROR: cleos: $!\n";
+            print "Output:\n";
+        }
+    } else {
+        if (! $mute) {
+            print "cleos finished successfully.\n";
+            print "Output:\n";
+        }
+    }
+    print $o;
+}
+
+# --abi <full-contract-name (or 'all')> [string-item-filter-name]
+
+if (@opt_abi) {
+    my $c = $opt_abi[0]; # contract name (1st arg)
+    my $s = '';          # no filter by default
+    if (scalar(@opt_abi) == 2) { $s = $opt_abi[1]; } # filter specified (2nd arg)
+
+    #while (my ($key, $value) = each %abis) {
+    my @sorted_contract_keys = sort keys %abis;
+    foreach my $key (@sorted_contract_keys) {
+        my $value = $abis{$key};
+        if (lc($c) eq 'all' || $key eq $c) {
+            print "$key:\n";
+            if ($s eq '') {
+                # TODO: consider decorating table names with { a,b,c,d,e,f } on the side (the struct)
+                print "  tables:\n";
+                foreach my $hash (@{$value->{tables}}) {
+                    my $name = $hash->{'name'};
+                    print "    $name\n";
+                }
+                # TODO: consider decorating action names with { a,b,c,d,e,f } on the side (the struct)
+                print "  actions:\n";
+                foreach my $hash (@{$value->{actions}}) {
+                    my $name = $hash->{'name'};
+                    print "    $name\n";
+                }
+            } else {
+                # For each contract that matches we will do this now:
+                # For each k,v of the contract's ABI.
+                #while (my ($k, $v) = each %{$value}) {
+                my @sorted_keys = sort keys %{$value};
+                foreach my $k (@sorted_keys) {
+                    my $v = $value->{$k};
+                    my $k_print = 0;
+                    if ($k eq $s || $s eq '.') {
+                        print "  $k:\n";
+                        $k_print = 1;
+                    }
+                    # Only interested in second level ABI item if its value is an array
+                    # (the array of structs, or actions, or tables, ...)
+                    if (ref($v) eq 'ARRAY') {
+                        my $a_count = 0;
+                        foreach my $e (@{$v}) {
+                            my $a_print = 0;
+                            # The elements of these arrays are always ek,ev maps, and
+                            #   subsequent values (ev) can be anything.
+                            #while (my ($ek, $ev) = each %{$e}) {
+                            my @sorted_hash_keys = sort keys %{$e};
+                            foreach my $ek (@sorted_hash_keys) {
+                                my $ev = $e->{$ek};
+                                if ($k eq $s || $s eq '.' || $ek eq $s || (exists $e->{'name'} && $e->{'name'} eq $s) || (exists $e->{'id'} && $e->{'id'} eq $s)) {
+                                    if (! $k_print) {
+                                        print "  $k:\n";
+                                        $k_print = 1;
+                                    }
+                                    if (! $a_print) {
+                                        # Search for the value of a key 'name' or 'id' or
+                                        #   something notable, use that as the header, otherwise
+                                        #   print a generic separator.
+                                        print "    ";
+                                        if (exists $e->{'name'}) {
+                                            print "'" . $e->{'name'} . "' ";
+                                        } elsif (exists $e->{'id'}) {
+                                            print "'" . $e->{'id'} . "' ";
+                                        }# else {
+                                        #    print "    #${a_count}:\n";
+                                        #}
+                                        print "(#${a_count}):\n";
+                                        $a_print = 1;
+                                    }
+                                    # Level 6 spacing is the "name" (identity) of ev.
+                                    #
+                                    #   If the array item is a scalar,
+                                    #   then it's just 6space $ek = $v
+
+                                    # Level 8 spacing is the item
+                                    if (ref($ev) eq 'ARRAY') {
+                                        print "      $ek:\n";
+                                        print dump_array($ev, 8);
+                                    } elsif (ref($ev) eq 'HASH') {
+                                        print "      $ek:\n";
+                                        print dump_hash($ev, 8);
+                                    } else {
+                                        print "      $ek = '$ev'\n";
+                                    }
+                                }
+                            }
+                            $a_count++;
+                        }
+                    } else {
+                        print "    '$v'\n";
+                    }
+                }
+            }
+        }
+    }
+}
+
+# --route <tile-id>
+
+if (@opt_route) {
+    my $dest_tile_id = $opt_route[0];
+
+    # - --route <tile-id>: returns a full tile route from the player's current tile to
+    #                      the given tile-id (assumes it is in the same map/region/area)
+    #                      q,r,s hex router in perl
+    #
+    #
+    #     - run route
+    #     - get the tile id of the next step in the route REQUIRES ENTIRE MAP DOWNLOADED AND CACHED
+
+    # fetch player record -- we already did, so use that.
+    my $obj = execute_player_hard_query();
+
+    # get the tile id
+    # FIXME/TODO: need a thing that navigates the struct searching for fields with values.
+    #             then if it finds it, returns it, otherwise returns undef, so we don't
+    #             have to be doing manual checks.
+    if (exists $obj->{'rows'} && scalar @{$obj->{rows}} > 0 && exists $obj->{'rows'}->[0]->{'location_tile_id'}) {
+
+        my $src_tile_id = $obj->{'rows'}->[0]->{'location_tile_id'};
+
+        # NOTE: this is an interesting perl coding pattern
+        # my $element = $dm{'contract-table'}->[37] if $dm{'contract-table'} && scalar(@{$dm{'contract-table'}}) > 37;
+        my $ct = "hegemon.${hgm}-tiles";
+
+        # transform source tile id in q,r,s via tile query
+        my $src_q = $dm{$ct}->{$src_tile_id}->{'q_coord'};
+        my $src_r = $dm{$ct}->{$src_tile_id}->{'r_coord'};
+        my $src_s = - $src_q - $src_r;
+
+        # transform dest tile id in q,r,s via tile query
+        my $dst_q = $dm{$ct}->{$dest_tile_id}->{'q_coord'};
+        my $dst_r = $dm{$ct}->{$dest_tile_id}->{'r_coord'};
+        my $dst_s = - $dst_q - $dst_r;
+
+        $src_tile_id = sprintf("%4d", $src_tile_id);
+        print "Source [Tile id: $src_tile_id]: ($src_q, $src_r, $src_s)\n";
+
+        # run route
+        my @route = find_shortest_path($src_q, $src_r, $src_s, $dst_q, $dst_r, $dst_s);
+        if (@route) {
+            foreach my $path (@route) {
+
+                # get the tile id of the next step in the route by searching the entire tile store
+                #   for matching q,r,s coords. FIXME/TODO: do something better than a brute force search
+                #   in a flat data dump (i.e. sort tiles with various client-side indices in the data model).
+
+                my $path_tile_id = "ERROR: NOT FOUND";
+                #while (my ($key, $value) = each %{$dm{$ct}}) {  # <--- this DOES NOT WORK (non-deterministic error) for some reason. "unintended side effects of 'each'"
+                # What a piece of junk. FIXME/TODO: get rid of every usage of 'each'
+                #https://blogs.perl.org/users/rurban/2014/04/do-not-use-each.html
+                foreach my $value (values %{$dm{$ct}}) {
+                    my $path_q = $value->{'q_coord'};
+                    my $path_r = $value->{'r_coord'};
+                    my $path_s = - $path_q - $path_r;
+                    if ($path_q == $path->[0] &&
+                        $path_r == $path->[1] &&
+                        $path_s == $path->[2]
+                        )
+                    {
+                        $path_tile_id = $value->{'id'}; #$key, if we had it
+                        last;
+                    }
+                }
+
+                $path_tile_id = sprintf("%4d", $path_tile_id);
+                print "       [Tile id: $path_tile_id]: (". $path->[0] . ", " . $path->[1] . ", " . $path->[2] . ")\n";
+            }
+        }
+        # Router includes the destination tile already
+        #$dest_tile_id = sprintf("%6d", $dest_tile_id);
+        #print "Target [Tile id: $dest_tile_id]: ($dst_q, $dst_r, $dst_s)\n";
+    } else {
+        print "ERR-000: Malformed player object found while executing --route\n";
+        exit 1;
+    }
+}
+
+# Table queries
+
+# process --contract option first
+if (@opt_contract) {
+    $force_query_contract = $opt_contract[0];
+    if ($verbose) { print "Forcing all queries against contract account name '$force_query_contract'\n"; }
+}
+
+if (@opt_squery) {
+    my @batch_query_args = @opt_query;  # does a deep copy, since everything is a scalar
+
+    # if first argument is NOT numeric, then we have to insert the default index (1)
+    if (!looks_like_number($batch_query_args[0])) {
+        splice(@batch_query_args, 0, 0, '1');  # Insert $element at position 0
+    }
+    if (scalar(@batch_query_args) > 6) { # index,table,scope,lower,upper,limit
+        print "ERROR: too many arguments to --squery\n";
+        exit 1;
+    }
+
+    run_batch_query(@batch_query_args);
+}
+
+if (@opt_query) {
+    my @batch_query_args = @opt_query;  # does a deep copy, since everything is a scalar
+
+    # if first argument is NOT numeric, then we have to insert the default index (1)
+    if (!looks_like_number($batch_query_args[0])) {
+        splice(@batch_query_args, 0, 0, '1');  # Insert $element at position 0
+    }
+
+    # doctor in the scope as '' (instructs run_batch_query() to copy the contract name)
+    splice(@batch_query_args, 2, 0, '');  # Insert $element at position 2  (0 is index -- see above --, 1 is table, 2 is scope)
+
+    if (scalar(@batch_query_args) > 6) { # index,table,scope,lower,upper,limit
+        print "ERROR: too many arguments to --query\n";
+        exit 1;
+    }
+
+    run_batch_query(@batch_query_args);
+}
+
+if (@opt_players) {
+    my $page_num = looks_like_number($opt_players[0]) ? $opt_players[0] : 0;
+    my $lo = $page_num * 100;
+    my $hi = $lo + 99;
+
+    if (! $mute) { print "Querying player page $page_num [$lo, $hi].\n"; }
+    $o = get_table("hegemon.${hgm}-players", "-L$lo -U$hi --limit 100", 0);
+    if ($o) {
+        print dump_hash($o, 0);
+    } else {
+        print "ERROR: Failed to query players table.\n";
+        exit 1;
+    }
+}
+
+# Player commands
+
+if ($opt_createchar)   { run_batch_command("createchar '{\"player\":\"$player\"}'"); }
+if (@opt_detokenize)   { run_batch_command("detokenize '{\"player\":\"$player\", \"quantity\":\"$opt_detokenize[0]\"}'"); }
+if (@opt_dodropoff)    { run_batch_command("dodropoff '{\"player\":\"$player\", \"items\":[$opt_dodropoff[0], $opt_dodropoff[1]]}'"); }
+if (@opt_doload)       { run_batch_command("doload '{\"player\":\"$player\", \"vehicle_id\":\"$opt_doload[0]\", \"items\":[$opt_doload[1], $opt_doload[2]]}'"); }
+if (@opt_domove)       { run_batch_command("domove '{\"player\":\"$player\", \"destination_tile_id\":\"$opt_domove[0]\"}'"); }
+if (@opt_dopickup)     { run_batch_command("dopickup '{\"player\":\"$player\", \"items\":[$opt_dopickup[0], $opt_dopickup[1]]}'"); }
+if (@opt_dounload)     { run_batch_command("dounload '{\"player\":\"$player\", \"vehicle_id\":\"$opt_dounload[0]\", \"items\":[$opt_dounload[1], $opt_dounload[2]]}'"); }
+if (@opt_joinfaction)  { run_batch_command("joinfaction '{\"player\":\"$player\", \"faction_id\":\"$opt_joinfaction[0]\"}'"); }
+if (@opt_tokenize)     { run_batch_command("tokenize '{\"player\":\"$player\", \"quantity\":\"$opt_tokenize[0]\"}'"); }
+
+# Character commands
+
+if (@opt_doaddmats)    { run_batch_command("doaddmats '{\"character_id\":\"$opt_doaddmats[0]\", \"project_id\":\"$opt_doaddmats[1]\", \"materials\":[$opt_doaddmats[2], $opt_doaddmats[3]]}'"); }
+if (@opt_doaddproj)    { run_batch_command("doaddproj '{\"character_id\":\"$opt_doaddproj[0]\", \"blueprint_id\":\"$opt_doaddproj[1]\"}'"); }
+if (@opt_dobuild)      { run_batch_command("dobuild '{\"character_id\":\"$opt_dobuild[0]\", \"project_id\":\"$opt_dobuild[1]\"}'"); }
+if (@opt_docancelproj) { run_batch_command("docancelproj '{\"character_id\":\"$opt_docancelproj[0]\", \"project_id\":\"$opt_docancelproj[1]\"}'"); }
+if (@opt_docivil)      { run_batch_command("docivil '{\"character_id\":\"$opt_docivil[0]\"}'"); }
+if (@opt_docommerce)   { run_batch_command("docommerce '{\"character_id\":\"$opt_docommerce[0]\"}'"); }
+if (@opt_docraft)      { run_batch_command("docraft '{\"character_id\":\"$opt_docraft[0]\", \"recipe_id\":\"$opt_docraft[1]\"}'"); }
+if (@opt_dodisembark)  { run_batch_command("dodisembark '{\"character_id\":\"$opt_dodisembark[0]\"}'"); }
+if (@opt_doeat)        { run_batch_command("doeat '{\"character_id\":\"$opt_doeat[0]\"}'"); }
+if (@opt_doembark)     { run_batch_command("doembark '{\"character_id\":\"$opt_doembark[0]\", \"vehicle_id\":\"$opt_doembark[1]\"}'"); }
+if (@opt_doeng)        { run_batch_command("doeng '{\"character_id\":\"$opt_doeng[0]\"}'"); }
+if (@opt_doequip)      { run_batch_command("doequip '{\"character_id\":\"$opt_doequip[0]\", \"gameasset_id\":\"$opt_doequip[1]\"}'"); }
+if (@opt_dofarming)    { run_batch_command("dofarming '{\"character_id\":\"$opt_dofarming[0]\"}'"); }
+if (@opt_dohealth)     { run_batch_command("dohealth '{\"character_id\":\"$opt_dohealth[0]\"}'"); }
+if (@opt_dointel)      { run_batch_command("dointel '{\"character_id\":\"$opt_dointel[0]\"}'"); }
+if (@opt_dologis)      { run_batch_command("dologis '{\"character_id\":\"$opt_dologis[0]\"}'"); }
+if (@opt_domilitary)   { run_batch_command("domilitary '{\"character_id\":\"$opt_domilitary[0]\"}'"); }
+if (@opt_domining)     { run_batch_command("domining '{\"character_id\":\"$opt_domining[0]\"}'"); }
+if (@opt_doresearch)   { run_batch_command("doresearch '{\"character_id\":\"$opt_doresearch[0]\"}'"); }
+if (@opt_dounequip)    { run_batch_command("dounequip '{\"character_id\":\"$opt_dounequip[0]\", \"gameasset_id\":\"$opt_dounequip[1]\"}'"); }
+if (@opt_revivechar)   { run_batch_command("revivechar '{\"character_id\":\"$opt_revivechar[0]\", \"payer\":\"$player\"}'"); }
+if (@opt_upgradechar)  { run_batch_command("upgradechar '{\"character_id\":\"$opt_upgradechar[0]\", \"new_role\":\"$opt_upgradechar[1]\"}'"); }
+
+# --------------------------------------------------------------------------------------------
+# If menu mode, enter menu loop (otherwise exit)
+# --------------------------------------------------------------------------------------------
+
+# Check if menu (interactive) mode disabled. That's the case when e.g. running commands
+#   in batch mode via command-line arguments.
+
+if (! $menu) {
+    if ($verbose) { print "Interactive mode disabled; exiting.\n"; }
+    exit;
+}
+
+# Interactive mode shows menus and allows the user to choose what to do next.
+
+print "Entering interactive (menu) game play mode. Press q, ESC or CTRL+C to quit.\n";
+
+# Open the interactive mode log file
+
+open(my $logf, '>', $log_file_name) or die "Could not open log file '$log_file_name' for writing: $!";
+print $logf "pldoh interactive mode log file created.\n";
+
+# Layout constants
+
+my $east_bar_width = 55;
+
+my $console_height = 20;
+my $console_lines = $console_height - 2;
+
+# Smart print inside a window
+
+sub printwin {
+    my $win = shift;
+    my $string = shift;
+
+    my $ends_with_newline = 0;
+    if ($string =~ /\n$/) {
+        $ends_with_newline = 1;
+    }
+
+    my @lines = split /(?<=\n)/, $string;
+    my $line_count = scalar @lines;
+    if ($line_count == 0 && $ends_with_newline) {
+        my ($y, $x);
+        getyx($win, $y, $x);
+        $win->move($y + 1, 1);
+    } else {
+        foreach my $index (0 .. $#lines) {
+            my $line = $lines[$index];
+            $line =~ s/\n//g;  # Remove any remaining "\n" characters
+
+            # Print the line, truncated if we run out of horizontal space
+            my ($y, $x);
+            getyx($win, $y, $x);  # Retrieve current y and x coordinates
+            my $remaining_space = $win->getmaxx() - $x - 1;
+            if (length($line) > $remaining_space) {
+                $line = substr($line, 0, $remaining_space);
+            }
+            $win->addstr("$line");
+
+            if ($index < $line_count - 1 || $ends_with_newline) {
+                my ($y, $x);
+                getyx($win, $y, $x);
+                $win->move($y + 1, 1);
+            }
+        }
+    }
+}
+
+# ..
+
+sub fail {
+    my $msg = shift;
+    endwin();
+    print "$msg\n";
+    print $logf "fail() called: $msg\n";
+    close($logf);
+    exit 1;
+}
+
+# Setup Curses, windows & Term::ReadKey
+# win1: player window
+# win2: character window
+# winc: console log
+# winm: menu (interactive) area
+
+my $n = 0;
+my $quit = 0;
+my $key;
+sub flush_keys {
+    while (defined($key = ReadKey(-1))) { }
+}
+flush_keys();
+
+my $stdscr = Curses::initscr();  # Create a Curses window object for stdscr
+cbreak(); # new -- this was not here before
+noecho();
+curs_set(0);
+#keypad(1);
+keypad($stdscr, 1);  # Enable keypad mode
+$SIG{'INT'} = sub { $quit = 1; };
+
+my ($cols, $rows, $new_cols, $new_rows);
+getmaxyx($stdscr, $rows, $cols);
+
+my $win1_starty = 1;
+my $winm_starty = 1;
+my $winm_startx = 0;
+my $winc_startx = 0;
+my ($win1_height, $win2_height, $winc_width, $winm_width, $winm_height, $win1_startx, $win2_startx, $win2_starty, $winc_starty);
+
+sub resize_windows() {
+    $win1_height = int($rows / 2) - 1;
+    $win2_height = $rows - $win1_height - 1;
+    $winc_width = $cols - $east_bar_width;
+    $winm_width = $cols - $east_bar_width;
+    $winm_height = $rows - $console_height - 1;
+    $win1_startx = $cols - $east_bar_width;
+    $win2_startx = $cols - $east_bar_width;
+    $win2_starty = $win1_height + 1;
+    $winc_starty = $rows - $console_height;
+}
+
+resize_windows();
+
+my $win1 = newwin($win1_height, $east_bar_width, $win1_starty, $win1_startx);
+my $win2 = newwin($win2_height, $east_bar_width, $win2_starty, $win2_startx);
+my $winc = newwin($console_height, $winc_width, $winc_starty, $winc_startx);
+my $winm = newwin($winm_height, $winm_width, $winm_starty, $winm_startx);
+
+refresh();
+
+# data & view model for the game interface
+
+# Win1 (player panel)
+my $obj_player;            # player object to display
+my $str_player = "???\n";  # string version for print
+
+# Win2 (char panel)
+my $obj_char_list;       # all characters for a char-list query
+my @char_names;          # string names of all player characters for display
+my @char_gids;           # global object IDs for the characters
+my $sel_char = '';       # currently selected character name; if '', no character selected yet.
+my $sel_char_gid = - 1;  # global ID (primary key) of the selected character
+my $obj_sel_char;        # selected character, for a specific char query. this is not used to print as it's patched into obj_char_list instead
+my $str_char = "???\n";  # string version for print in the char screen (either 1 selected character or character list)
+
+# Redraw control (so we don't query the API and/or redraw the screen every
+#   time unnecessarily)
+
+# Refresh the data model by querying the API, and refresh the screen.
+# When signaled, all these force a hard query to the API, bypassing the cache (cache expiry = 0s).
+# The cache is really only for the noninteractive (batch) mode.
+my $refresh_player = 0;
+my $refresh_character_list = 0;
+my $refresh_character = 0;
+
+my $dw = 1; # need a global redraw
+
+my $refresh_all = 1; # first-time delayed data model refresh
+
+# Subs called by the commands to update the view
+
+# Print to the console
+
+my $max_console_lines_to_store = $console_lines;
+my $console_separator = "-" x 100;
+
+my @console = (); # content for the console window, append lines when printing, keeps a certain number of lines
+
+sub printcon {
+    # break the string to print into lines
+    my $string = shift;
+    my @big_lines = split /(?<=\n)/, $string;
+
+    # preprocessing: break lines at the current console width
+    my $width = $winc_width - 2;
+    my @lines;
+    foreach my $line (@big_lines) {
+        if (length($line) > $width) {
+            my $start = 0;
+            while ($start < length($line)) {
+                push @lines, substr($line, $start, $width);
+                $start += $width;
+            }
+        } else {
+            push @lines, $line;
+        }
+    }
+
+    # push lines into the console
+    foreach my $index (0 .. $#lines) {
+        my $line = $lines[$index];
+        $line =~ s/\n//g;  # Remove any remaining "\n" characters
+        push @console, $line;
+        print $logf "$con_log_prefix$line\n";
+    }
+    if ($string =~ /\n$/) {
+        push @console, '';
+        print $logf "$con_log_prefix\n";
+    }
+
+    # gc old console lines from the start of the @console array
+    if (@console > $max_console_lines_to_store) {
+        my $elements_to_remove = @console - $max_console_lines_to_store;
+        splice(@console, 0, $elements_to_remove);
+    }
+}
+
+sub dumpcon {
+    my $string = shift;
+    $string = strip_newlines($string);
+    printcon($string);
+}
+
+sub update_character_window {   # Update what shows in Win2, i.e. $str_char.
+    if ($sel_char eq '') {
+        # No selected char, so display char list
+        $str_char = '';
+        foreach my $index (0..$#char_gids) {
+            my $char_gid  = $char_gids [$index];
+            my $char_name = $char_names[$index];
+            $str_char .= "[$char_gid] $char_name\n";
+        }
+    } else {
+        # Selected char, so display that char's data
+        # Right now, it's a simple JSON object dump (FIXME/TODO: cooler display)
+        foreach my $hash_ref (@$obj_char_list) {
+            my %hash = %$hash_ref;  # Dereference the hash reference
+            if (exists $hash{$id_key}) {
+                my $gid = $hash{$id_key};
+                if ($gid == $sel_char_gid) {
+                    $str_char = dump_hash($hash_ref, 0);
+                    $str_char = pack_dump_str($str_char, $east_bar_width - 2);
+                    return; # we are done here, exit sub
+                }
+            } else {
+                printcon("ERROR: iterating obj_char_list found char obj without GID");
+            }
+        }
+        # if reached here, could not find the object for the selected char
+        printcon("ERROR: sel_char_gid $sel_char_gid not found in obj_char_list");
+        $str_char = "[$sel_char_gid] $sel_char\nERROR: NO OBJ";
+    }
+}
+
+# When a menu command is invoked
+
+sub cmd_list_chars {
+    $sel_char = '';
+    $sel_char_gid = - 1;
+    printcon("Unselected char");
+    update_character_window();
+}
+
+sub cmd_next_char {
+    my $index = -1;
+    if ($sel_char eq '') {  # no char selected currently
+        if (scalar(@char_names) == 0) {
+            printcon("Can't select a character: player appears to not have any characters.");
+            return;
+        } else { # select first char
+            $index = 0;
+        }
+    } else {
+        foreach my $i (0 .. scalar(@char_names) - 1) {
+            if ($char_names[$i] eq $sel_char) {
+                $index = $i;
+                last;
+            }
+        }
+        if ($index >= 0) { # found current char
+            $index++;  # will select next char after current
+            if ($index >= scalar(@char_names)) {
+                $index = 0; # wrap around char array
+            }
+        } else {
+            printcon("ERROR: cannot select next character as current char $sel_char not found.");
+            return;
+        }
+    }
+    $sel_char     = $char_names[$index];
+    $sel_char_gid = $char_gids [$index];
+    printcon("Selected char: [$sel_char_gid] $sel_char");
+    update_character_window();
+}
+
+sub cmd_create_char {
+    my $createchar_cmd = "$cleos -u $api push action hegemon.${hgm} createchar '{\"player\":\"$player\"}' -p $player $old_rpc_postfix $postfix";
+    printcon("Executing: $createchar_cmd");
+    $o = `$createchar_cmd`;
+    if ($? != 0) {
+        printcon("ERROR: createchar: $o");
+    } else {
+        $refresh_character_list = 1;
+    }
+}
+
+sub cmd_doeat {
+    if ($sel_char eq '') {
+        printcon("ERROR: Must have a character selected.");
+        return;
+    }
+
+    my $cmd = "$cleos -u $api push action hegemon.${hgm} doeat '{\"character_id\":\"$sel_char_gid\"}' -p $player $old_rpc_postfix $postfix";
+    printcon("Executing: $cmd");
+    $o = `$cmd`;
+    if ($? != 0) {
+        printcon("ERROR: doeat: $o");
+    } else {
+        # FIXME/TODO: Here we have to think about how we want to go about refreshing state.
+        #             Maybe refresh every minute for 3 minutes since the last action... a refresh counter, plus a button for the player to refresh more.
+        $refresh_character = 1;
+
+        # Refresh player to show the subtracted food
+        $refresh_player = 1;
+    }
+}
+
+sub cmd_domining {
+    if ($sel_char eq '') {
+        printcon("ERROR: Must have a character selected.");
+        return;
+    }
+
+    my $cmd = "$cleos -u $api push action hegemon.${hgm} domining '{\"character_id\":\"$sel_char_gid\"}' -p $player $old_rpc_postfix $postfix";
+    printcon("Executing: $cmd");
+    $o = `$cmd`;
+    if ($? != 0) {
+        printcon("ERROR: domining: $o");
+    } else {
+        # FIXME/TODO: Here we have to think about how we want to go about refreshing state.
+        #             Maybe refresh every minute for 3 minutes since the last action... a refresh counter, plus a button for the player to refresh more.
+        $refresh_character = 1;
+    }
+}
+
+sub cmd_doengineering {
+    if ($sel_char eq '') {
+        printcon("ERROR: Must have a character selected.");
+        return;
+    }
+
+    my $cmd = "$cleos -u $api push action hegemon.${hgm} doeng '{\"character_id\":\"$sel_char_gid\"}' -p $player $old_rpc_postfix $postfix";
+    printcon("Executing: $cmd");
+    $o = `$cmd`;
+    if ($? != 0) {
+        printcon("ERROR: doeng: $o");
+    } else {
+        # FIXME/TODO: Here we have to think about how we want to go about refreshing state.
+        #             Maybe refresh every minute for 3 minutes since the last action... a refresh counter, plus a button for the player to refresh more.
+        $refresh_character = 1;
+    }
+}
+
+sub cmd_dofarming {
+    if ($sel_char eq '') {
+        printcon("ERROR: Must have a character selected.");
+        return;
+    }
+
+    my $cmd = "$cleos -u $api push action hegemon.${hgm} dofarming '{\"character_id\":\"$sel_char_gid\"}' -p $player $old_rpc_postfix $postfix";
+    printcon("Executing: $cmd");
+    $o = `$cmd`;
+    if ($? != 0) {
+        printcon("ERROR: dofarming: $o");
+    } else {
+        # FIXME/TODO: Here we have to think about how we want to go about refreshing state.
+        #             Maybe refresh every minute for 3 minutes since the last action... a refresh counter, plus a button for the player to refresh more.
+        $refresh_character = 1;
+    }
+}
+
+sub cmd_dologistics {
+    if ($sel_char eq '') {
+        printcon("ERROR: Must have a character selected.");
+        return;
+    }
+
+    my $cmd = "$cleos -u $api push action hegemon.${hgm} dologis '{\"character_id\":\"$sel_char_gid\"}' -p $player $old_rpc_postfix $postfix";
+    printcon("Executing: $cmd");
+    $o = `$cmd`;
+    if ($? != 0) {
+        printcon("ERROR: dologis: $o");
+    } else {
+        # FIXME/TODO: Here we have to think about how we want to go about refreshing state.
+        #             Maybe refresh every minute for 3 minutes since the last action... a refresh counter, plus a button for the player to refresh more.
+        $refresh_character = 1;
+    }
+}
+
+sub cmd_dohealthcare {
+    if ($sel_char eq '') {
+        printcon("ERROR: Must have a character selected.");
+        return;
+    }
+
+    my $cmd = "$cleos -u $api push action hegemon.${hgm} dohealth '{\"character_id\":\"$sel_char_gid\"}' -p $player $old_rpc_postfix $postfix";
+    printcon("Executing: $cmd");
+    $o = `$cmd`;
+    if ($? != 0) {
+        printcon("ERROR: dohealth: $o");
+    } else {
+        # FIXME/TODO: Here we have to think about how we want to go about refreshing state.
+        #             Maybe refresh every minute for 3 minutes since the last action... a refresh counter, plus a button for the player to refresh more.
+        $refresh_character = 1;
+    }
+}
+
+sub cmd_revive_char {
+    if ($sel_char eq '') {
+        printcon("ERROR: Must have a character selected.");
+        return;
+    }
+
+    my $cmd = "$cleos -u $api push action hegemon.${hgm} revivechar '{\"character_id\":\"$sel_char_gid\", \"payer\":\"$player\"}' -p $player $old_rpc_postfix $postfix";
+    printcon("Executing: $cmd");
+    $o = `$cmd`;
+    if ($? != 0) {
+        printcon("ERROR: revivechar: $o");
+    } else {
+        # FIXME/TODO: Here we have to think about how we want to go about refreshing state.
+        #             Maybe refresh every minute for 3 minutes since the last action... a refresh counter, plus a button for the player to refresh more.
+        $refresh_character = 1;
+    }
+}
+
+# Interactive menu functionality
+
+my $str_menu = "???\n";  # entire contents of the menu panel
+my @menu_map = ();       # each element of this array is another array (a pair [menu item, reference of sub to call])
+
+# Assemble a string for printwin() inside the menu window
+# FIXME/TODO: more sophisticated item layout options (item width vs. window width)
+sub build_menu_str {
+    $str_menu = shift;
+    $str_menu .= "\n\n";
+    foreach my $pair (@menu_map) {
+        my ($key, $value) = @$pair;
+        $str_menu .= $key;
+        $str_menu .= "\n";
+    }
+}
+
+sub set_main_menu {
+    @menu_map = ();
+    push @menu_map, ['1. List chars',  \&cmd_list_chars];
+    push @menu_map, ['2. Next char',   \&cmd_next_char];
+    push @menu_map, ['3. Create char', \&cmd_create_char];
+    push @menu_map, ['4. Feed char',   \&cmd_doeat];
+    push @menu_map, ['m. Char do Mining',       \&cmd_domining];
+    push @menu_map, ['e. Char do Engineering',  \&cmd_doengineering];
+    push @menu_map, ['f. Char do Farming',      \&cmd_dofarming];
+    push @menu_map, ['l. Char do Logistics',    \&cmd_dologistics];
+    push @menu_map, ['h. Char do Healthcare',   \&cmd_dohealthcare];
+    push @menu_map, ['R. Revive char',   \&cmd_revive_char];
+    build_menu_str("Main menu\n\nF5: Force refresh player | F6: Force refresh char | F7: Force refresh ALL chars\n\n");
+};
+
+# ====
+# Loop
+# ====
+
+set_main_menu();
+
+printcon("Entering pldoh interactive mode.");
+printcon("To run in batch mode instead, use -b or --batch (-h, --help for help).");
+printcon("The window above this message window is the interactive area.");
+printcon("Press the key associated with the menu option to execute it.");
+printcon("Press q or CTRL+C to quit.");
+#printcon("Press F1 to print help on the message window (FIXME/TODO).");
+printcon($console_separator);
+
+while (!$quit) {
+
+    while (defined($key = ReadKey(-1))) {
+        if ($key eq 'q') {
+            $quit = 1;
+        } elsif (ord($key) == 27) {
+            my $kseq = '';
+            while (defined($key = ReadKey(-1))) {
+                if ($kseq ne '') { $kseq .= ','; }
+                $kseq .= ord($key);
+            }
+            if ($kseq eq '') {
+                # plain ESC key
+                printcon("FIXME/TODO: ESC key changes the current winm, e.g. return to main menu");
+                $dw = 1;
+            } elsif ($kseq eq '91,49,53,126') {   # F5 (at least in my environment...)
+                printcon("F5: Refresh player.");
+                $refresh_player = 1;
+            } elsif ($kseq eq '91,49,55,126') {   # F6 (at least in my environment...)
+                printcon("F6: Refresh character.");
+                $refresh_character = 1;
+            } elsif ($kseq eq '91,49,56,126') {   # F7 (at least in my environment...)
+                printcon("F7: Refresh character list (ALL characters).");
+                $refresh_character_list = 1;
+            } else {
+                # Debug keypress
+                printcon("Escape sequence: $kseq"); $dw = 1;
+            }
+        } else {
+            #my $foundmenu = 0;
+            # Check for a key press that matches a menu item, if so, invoke the respective menu sub
+            foreach my $pair (@menu_map) {
+                my ($mitem, $value) = @$pair;
+                if (substr($mitem, 0, 1) eq $key) {
+                    #printcon("Key: $key | Code: " . ord($key) . "  (MENU)");
+                    printwin($winm, "\n** PROCESSING MENU OPTION: $mitem **\n");
+                    wrefresh($winm);
+                    $value->();  # call menu command sub
+                    flush_keys(); # don't queue a bunch of commands after the one we just took some time to run
+                    $dw = 1;
+                    #$foundmenu = 1;
+                    last;
+                }
+            }
+            # Debug keypresses
+            #if (! $foundmenu) {
+            #    printcon("Key: $key | Code: " . ord($key));
+            #    $dw = 1;
+            #}
+        }
+    }
+
+    # Terminal size change triggers a redraw
+    getmaxyx($stdscr, $new_rows, $new_cols);
+    if ($new_rows != $rows or $new_cols != $cols) {
+
+        $rows = $new_rows;
+        $cols = $new_cols;
+
+        resize_windows();
+
+        # Resize and move the windows
+        clear();
+        wresize($win1, $win1_height, $east_bar_width);
+        mvwin($win1, $win1_starty, $win1_startx);
+        wresize($win2, $win2_height, $east_bar_width);
+        mvwin($win2, $win2_starty, $win2_startx);
+        wresize($winc, $console_height, $winc_width);
+        mvwin($winc, $winc_starty, $winc_startx);
+        wresize($winm, $winm_height, $winm_width);
+        mvwin($winm, $winm_starty, $winm_startx);
+
+        # If you comment this out, it DOES NOT WORK!
+        # Even with a refresh in the main loop!
+        refresh();
+
+        $dw = 1;
+    }
+
+    # Object refresh requests trigger a redraw
+    if ($refresh_player || $refresh_character || $refresh_character_list) {
+        $dw = 1;
+    }
+
+    # If we need a global screen redraw:
+    if ($dw) {
+        $dw = 0;
+
+        # Compose the windows and display them
+        wclear($win1);
+        wclear($win2);
+        wclear($winc);
+        wclear($winm);
+        box($win1, 0, 0);
+        box($win2, 0, 0);
+        box($winc, 0, 0);
+        box($winm, 0, 0);
+
+        # Resolve win1 (player window)
+
+        $win1->move(1, 1);
+        printwin($win1, "Player: $player\n\n");
+        printwin($win1, $str_player);
+        printwin($win1, "\n");
+
+        if ($refresh_player) {
+            $refresh_player = 0;
+            printwin($win1, "** REFRESHING PLAYER **\n");
+            wrefresh($win1);
+
+            my $query_player = get_table("hegemon.${hgm}-players", "--key-type i64 --index 2 -L$player -U$player", 0);
+            $obj_player = $query_player->{'rows'}->[0];
+            $str_player = dump_hash($obj_player, 0);
+            $str_player = pack_dump_str($str_player, $east_bar_width - 2);
+
+            $dw = 1;
+        }
+
+        # Resolve win2 (character window)
+
+        $win2->move(1, 1);
+        if ($sel_char eq '') {
+            # Char list mode
+            printwin($win2, "Characters (". scalar(@char_gids) ."):\n\n");
+            printwin($win2, $str_char);
+            printwin($win2, "\n");
+        } else {
+            # Selected char mode
+            printwin($win2, "Character: $sel_char\n\n");
+            printwin($win2, $str_char);
+            printwin($win2, "\n");
+        }
+
+        if ($refresh_character_list) {
+            $refresh_character_list = 0;
+
+            printwin($win2, "** REFRESHING CHARACTER LIST **\n");
+            wrefresh($win2);
+
+            # Queries for all characters of a player in one shot
+            # This is used to assemble an obj_char_list within which we know ALL(<=100) characters are in (--limit 100), so that
+            #   individual character queries can be used to update the respective individual element of obj_char_list.
+            my $query_character_list = get_table("hegemon.${hgm}-characters", "--key-type i64 --index 2 -L$player -U$player --limit 100", 0);
+            $obj_char_list = $query_character_list->{'rows'};
+
+            # If need to debug and dump the list object  (TODO: remove)
+            printcon("Character list array dump:");
+            dumpcon(dump_array($obj_char_list, 0));
+
+            # Build the base character list data model
+            @char_gids = ();
+            @char_names = ();
+            foreach my $chobj (@{$obj_char_list}) {
+
+                my $chgid = $chobj->{$id_key};
+                if (defined $chgid) {
+                    push @char_gids, $chgid;
+                } else {
+                    printcon("ERROR: char record without $id_key");
+                }
+
+                my $chname = '';
+                if (exists $chobj->{'first_name'}) {
+                    $chname = $chobj->{'first_name'};
+                } else {
+                    printcon("ERROR: char record without first_name");
+                }
+                if (exists $chobj->{'last_name'}) {
+                    $chname .= " " . $chobj->{'last_name'};
+                } else {
+                    printcon("ERROR: char record without last_name");
+                }
+                push @char_names, $chname;
+            }
+
+            # Force refresh the $str_char string that is the entire character window (Win2)
+            #  (in case it's showing the character list we just updated)
+            update_character_window();
+
+            $dw = 1;
+        }
+
+        if ($refresh_character) {
+            $refresh_character = 0;
+
+            if ($sel_char_gid < 0) {
+                printcon("ERROR: Cannot refresh character: no character selected.");
+            } else {
+                printwin($win2, "** REFRESHING CHARACTER **\n");
+                wrefresh($win2);
+
+                # Query for a selected character by its global object ID ($sel_char_gid)
+                my $query_character = get_table("hegemon.${hgm}-characters", "-L$sel_char_gid -U$sel_char_gid", 0);
+                $obj_sel_char = $query_character->{'rows'}->[0];
+
+                # Paste the updated obj_sel_char inside the corresponding char's entry in obj_char_list
+                #   (it should be there; if it isn't, that's an error)
+                for my $index (0 .. $#{$obj_char_list}) {
+                    my $hash_ref = $obj_char_list->[$index];
+                    if (exists $hash_ref->{$id_key}) {
+                        my $gid = $hash_ref->{$id_key};
+                        if (exists $obj_sel_char->{$id_key}) {
+                            if ($gid eq $obj_sel_char->{$id_key}) {
+                                $obj_char_list->[$index] = $obj_sel_char;
+                                last;
+                            }
+                        } else {
+                            printcon("ERROR: obj_sel_char does not have a GID");
+                        }
+                    } else {
+                        printcon("ERROR: obj_char_list has element without a GID");
+                    }
+                }
+
+                # nope, we don't update the window here
+                #$str_char = dump_hash($obj_sel_char, 0);
+
+                if (exists $obj_sel_char->{'first_name'}) {
+                    $sel_char = $obj_sel_char->{'first_name'};
+                } else {
+                    printcon("ERROR: sel char record without first_name");
+                }
+                # TODO: add middle names
+                #if (exists $obj_sel_char->{'middle_name'}) {
+                #    $sel_char .= " " . $obj_sel_char->{'middle_name'};
+                #} else {
+                #    printcon("ERROR: char record without middle_name");
+                #}
+                if (exists $obj_sel_char->{'last_name'}) {
+                    $sel_char .= " " . $obj_sel_char->{'last_name'};
+                } else {
+                    printcon("ERROR: sel char record without last_name");
+                }
+
+                # Force refresh the $str_char string that is the entire character window (Win2)
+                #   (in case it's showing the stats of the character we just updated)
+                update_character_window();
+            }
+
+            $dw = 1;
+        }
+
+        # Resolve winc (console)
+
+        $winc->move(1, 1);
+        my $console_size = scalar @console;
+        for (my $i = $console_size - $console_lines; $i < $console_size; $i++) {
+            if ($i >= 0) {
+                printwin($winc, $console[$i]);
+            }
+            printwin($winc, "\n");
+        }
+
+        # Resolve winm (interactive area)
+
+        $winm->move(1, 1);
+        printwin($winm, $str_menu);
+        # FIXME/TODO: display different menu mode for when the user is entering a string
+
+        # Refresh all four windows
+
+        wrefresh($win1);
+        wrefresh($win2);
+        wrefresh($winc);
+        wrefresh($winm);
+
+        # This one for some reason seems OK to comment out (this would be expected
+        #   except there's some reason the refresh() at the resize code above cannot
+        #   be commented out.)
+        #refresh();
+    }
+
+    # Debug (FIXME/REMOVE)
+    $n = $n + 1;
+    move(0, 0);
+    addstr("$n");
+
+    # This is needed for some reason, at least for window resizing.
+    # TODO: check if needed for other content updates as well (i.e.
+    #    refresh() during content changes would be completely useless.)
+    refresh();
+
+    # one-time trigger window table queries (blocking) after we performed at least one redraw
+    if ($refresh_all) {
+        $refresh_all = 0;
+        $refresh_player = 1;
+        $refresh_character_list = 1;
+    }
+
+    sleep(0.1); # Sleep for 0.1 ms
+}
+
+endwin();
+
+print $logf "pldoh exiting normally.\n";
+close($logf);
+
+print "Finishing interactive mode.\n";
