@@ -1146,12 +1146,10 @@ sub load_all_game_data {
          "staking.${tcn}"
         );
 
-    # load all tables
+    # load all ABIs
     foreach my $contract (@contracts_to_load_abi) {
         if ($verbose) { print "Loading ABI for $contract..."; }
-
         $abis{$contract} = get_abi($contract, $forever_seconds, 0);
-
         if ($verbose) { print "OK.\n"; }
     }
 }
@@ -1165,7 +1163,6 @@ sub load_all_game_data {
 
 # General
 my $opt_help;
-my @opt_abi;
 my $opt_batch;
 my $opt_mute;
 my @opt_player;
@@ -1177,6 +1174,7 @@ my @opt_cleos;
 my @opt_cleostx;
 
 # Queries
+my @opt_abi;
 my @opt_contract;
 my @opt_query;
 my @opt_squery;
@@ -1226,7 +1224,6 @@ my @opt_upgradechar;
 GetOptions(
     # General options
     'help|h'            => \$opt_help,
-    'abi=s{1,2}'        => \@opt_abi,           # fullcontractname|'all', abi-item/key-name
     'batch|b'           => \$opt_batch,
     'mute|m'            => \$opt_mute,
     'player|p'          => \@opt_player,        # playername
@@ -1237,7 +1234,8 @@ GetOptions(
     'cleostx=s{1}'      => \@opt_cleostx,       # "full cleos params string"
     'cleos=s{1}'        => \@opt_cleos,         # "full cleos params string"
 
-    # Table queries
+    # Table/ABI queries
+    'abi=s{1,2}'        => \@opt_abi,           # fullcontractname|'all', abi-item/key-name
     'contract=s{1}'     => \@opt_contract,      # full contract name (with prefix and suffix, e.g. "hegemon.hgm")
     'q|query=s{1,5}'    => \@opt_query,         # [index=1] table [lower] [upper] [limit]
     's|squery=s{2,6}'   => \@opt_squery,        # [index=1] table scope [lower] [upper] [limit]
@@ -1301,9 +1299,6 @@ if ($opt_help) {
     print "  pldoh [OPTIONS]\n";
     print "\n";
     print "General options:\n";
-    print "  --abi <c> [s]        Print ABI of contract c or specifics of item s of c; if c\n";
-    print "                       is 'all', process all contracts; if s is omitted, prints a\n";
-    print "                       short summary of contract(s); if s is '.', match everything\n";
     print "  --batch, -b          Non-interactive mode: process all supplied options and exit\n";
     print "  --help, -h           Print this help and exit\n";
     print "  --mute, -m           Suppress some important messages (e.g. wallet unlocking) for\n";
@@ -1319,8 +1314,11 @@ if ($opt_help) {
     print "                       --wallet-url, -u, -p, -t & --use-old-send-rpc cleos options)\n";
     print "\n";
     print "Queries:\n";
-    print "  --contract <c>              Contract for query (with suffix e.g. \"hegemon.hgm\")\n";
-    print "                              If not specified, pldoh will attempt to guess it\n";
+    print "  --abi <c> [s]        Print ABI of contract c or specifics of item s of c; if c\n";
+    print "                       is 'all', process all contracts; if s is omitted, prints a\n";
+    print "                       short summary of contract(s); if s is '.', match everything\n";
+    print "  --contract <c>       Contract for table queries (with suffix e.g. \"hegemon.hgm\");\n";
+    print "                       if not specified, pldoh will attempt to guess it\n";
     print "  --query, -q [i] <t> [L] [U] [n]  Run a Smart Query (queries any game table)\n";
     print "      [i]    If first argument is numeric: table index to use (default is 1)\n";
     print "      <t>    Smart Query table name (e.g. \"players\"; contract/scope is guessed)\n";
@@ -1331,7 +1329,7 @@ if ($opt_help) {
     print "             then the upper bound will be the same as lower bound (exact match)\n";
     print "      [n]    Max number of records to return, default=100 (cleos '--limit' option)\n";
     print "  --squery, -s [i] <t> <s> [L] [U] [n]   Run Smart Query using contract scope s\n";
-    print "  --players <n>               Get page <n> of players (n >= 0); 100 per page\n";
+    print "  --players <n>         Get page <n> of players (n >= 0); 100 per page\n";
     print "\n";
     print "Player commands:\n";
     print "  --createchar                Attempt to spawn a new character (costs 1 CRYOPOD)\n";
@@ -1374,8 +1372,8 @@ if ($opt_help) {
 # If any intrinsically batch job or flag is provided (game query, game command, ...) we force batch mode.
 # If any option that sends transactions is called, we set txsign to 1
 
-if (@opt_abi || $opt_batch || @opt_route
-    || @opt_query || @opt_squery || @opt_players
+if ($opt_batch || @opt_route
+    || @opt_abi || @opt_query || @opt_squery || @opt_players
     )
 {
     $menu = 0;
@@ -2109,14 +2107,6 @@ if (@opt_abi) {
 if (@opt_route) {
     my $dest_tile_id = $opt_route[0];
 
-    # - --route <tile-id>: returns a full tile route from the player's current tile to
-    #                      the given tile-id (assumes it is in the same map/region/area)
-    #                      q,r,s hex router in perl
-    #
-    #
-    #     - run route
-    #     - get the tile id of the next step in the route REQUIRES ENTIRE MAP DOWNLOADED AND CACHED
-
     # fetch player record -- we already did, so use that.
     my $obj = execute_player_hard_query();
 
@@ -2176,9 +2166,6 @@ if (@opt_route) {
                 print "       [Tile id: $path_tile_id]: (". $path->[0] . ", " . $path->[1] . ", " . $path->[2] . ")\n";
             }
         }
-        # Router includes the destination tile already
-        #$dest_tile_id = sprintf("%6d", $dest_tile_id);
-        #print "Target [Tile id: $dest_tile_id]: ($dst_q, $dst_r, $dst_s)\n";
     } else {
         print "ERR-000: Malformed player object found while executing --route\n";
         exit 1;
