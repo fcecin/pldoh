@@ -583,7 +583,11 @@ sub dump_hash {
             $o .= dump_array($value, $indent + 1);
             $o .= "$indentation]\n";
         } else {
-            $o .= "\"$value\"\n";
+            if (!defined $value) {
+                $o .= "<null>\n";
+            } else {
+                $o .= "\"$value\"\n";
+            }
         }
     }
     return $o;
@@ -606,7 +610,11 @@ sub dump_array {
             $o .= dump_array($value, $indent + 1);
             $o .= "$indentation]\n";
         } else {
-            $o .= "\"$value\"\n";
+            if (!defined $value) {
+                $o .= "<null>\n";
+            } else {
+                $o .= "\"$value\"\n";
+            }
         }
     }
     return $o;
