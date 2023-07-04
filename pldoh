@@ -46,8 +46,6 @@
 #
 # - LATER: solve "all" in place of quantity for dopickup & dodropoff
 #
-# - LATER: solve tile direction in place of tile id for --domove (N,W,E,S,SW,NW,SE,NE)
-#
 # - LATER: add token-manipulation functions for TCN and etc. balances.
 #          send and receive tokens (transfer, stake, unstake)
 #
@@ -67,10 +65,6 @@
 #        pending a resolve (we count those and display).
 #
 # - LATER: in menu mode, resolve state queries on a separate thread so they don't lock up the UI
-#
-# - LATER: sub and --cmd get the adjacent tiles of a tile N, S, NE, SE, NW, SW
-#          W -> SW or NW, depending on tile X coordinate %2
-#          E -> SE or NE, depending on tile X coordinate %2
 #
 # - LATER: complete the menu play design (e.g. how to display terrain, input forms, multiple windows)
 #
@@ -1019,6 +1013,34 @@ sub purge_cache { # find every player subdirectory and wipe it clean (but retain
     }
 }
 
+sub get_neighbor_qrs {
+    my ($src_q, $src_r, $src_s, $dir) = @_;
+    $dir = lc($dir);
+    my ($dst_q, $dst_r, $dst_s);
+    if ($dir eq 'w') {
+        if ($src_q % 2 == 0) { $dir = 'nw'; } else { $dir = 'sw'; }
+    } elsif ($dir eq 'e') {
+        if ($src_q % 2 == 0) { $dir = 'ne'; } else { $dir = 'se'; }
+    }
+    if ($dir eq 'n') {
+        ($dst_q, $dst_r, $dst_s) = ($src_q, $src_r - 1, $src_s + 1);
+    } elsif ($dir eq 's') {
+        ($dst_q, $dst_r, $dst_s) = ($src_q, $src_r + 1, $src_s - 1);
+    } elsif ($dir eq 'nw') {
+        ($dst_q, $dst_r, $dst_s) = ($src_q - 1, $src_r, $src_s + 1);
+    } elsif ($dir eq 'sw') {
+        ($dst_q, $dst_r, $dst_s) = ($src_q - 1, $src_r + 1, $src_s);
+    } elsif ($dir eq 'ne') {
+        ($dst_q, $dst_r, $dst_s) = ($src_q + 1, $src_r - 1, $src_s);
+    } elsif ($dir eq 'se') {
+        ($dst_q, $dst_r, $dst_s) = ($src_q + 1, $src_r, $src_s - 1);
+    } else {
+        print "ERR-000: get_neighbor_qrs(): invalid direction: $dir\n";
+        exit 1;
+    }
+    return ($dst_q, $dst_r, $dst_s);
+}
+
 sub hex_distance {
     my ($q1, $r1, $s1, $q2, $r2, $s2) = @_;
     return (abs($q1 - $q2) + abs($r1 - $r2) + abs($s1 - $s2)) / 2;
@@ -1051,6 +1073,86 @@ sub find_shortest_path {
         push @path, [$src_q, $src_r, $src_s];
     }
     return @path;
+}
+
+sub get_tile_id_by_qrsa {
+    my ($q, $r, $s, $area) = @_;
+    my $ct = "hegemon.${hgm}-tiles";
+    foreach my $value (values %{$dm{$ct}}) {
+        my $path_q = $value->{'q_coord'};
+        my $path_r = $value->{'r_coord'};
+        my $path_s = 0 - $path_q - $path_r;
+        my $path_area = $value->{'area_map'};
+        if ($path_q == $q &&
+            $path_r == $r &&
+            $path_s == $s &&
+            $path_area eq $area
+            )
+        {
+            return $value->{'id'}; #$key, if we had it
+        }
+    }
+    return;
+}
+
+sub route_player {
+    # Array is either empty (something went wrong), or the first element returned is the player's area name.
+    # Then, the first element after that is a qrs triad which is the player's location.
+    # Then the route, which will include the destination tile.
+
+    my $dest = shift;
+    if (! defined $dest) {
+        print "ERR-000: route_player(): no dest\n";
+        exit 1;
+    }
+
+    # this will contain the route, or empty if can't for any reason
+    my @route;
+
+    # fetch player record -- we already did, so use that.
+    my $obj = execute_player_hard_query();
+
+    # get the tile id
+    # FIXME/TODO: need a thing that navigates the struct searching for fields with values.
+    #             then if it finds it, returns it, otherwise returns undef, so we don't
+    #             have to be doing manual checks.
+    if (exists $obj->{'rows'} && scalar @{$obj->{rows}} > 0 && exists $obj->{'rows'}->[0]->{'location_tile_id'}) {
+
+        my $src_tile_id = $obj->{'rows'}->[0]->{'location_tile_id'};
+
+        my $ct = "hegemon.${hgm}-tiles";
+
+        # transform source tile id in q,r,s via tile query
+        my $src_q = $dm{$ct}->{$src_tile_id}->{'q_coord'};
+        my $src_r = $dm{$ct}->{$src_tile_id}->{'r_coord'};
+        my $src_s = 0 - $src_q - $src_r;
+        my $area = $dm{$ct}->{$src_tile_id}->{'area_map'};
+
+        # figure out the area the player is in, and smuggle it as the first element of the returned route
+        push @route, $area;
+
+        # push the player's current position
+        push @route, [$src_q, $src_r, $src_s];
+
+        my ($dst_q, $dst_r, $dst_s);
+        if (! looks_like_number($dest)) {
+            # if dest isn't numeric, then it can only be a cardinal direction
+            my ($dst_q, $dst_r, $dst_s) = get_neighbor_qrs($src_q, $src_r, $src_s, $dest);
+            push @route, [$dst_q, $dst_r, $dst_s]; # direct route to neighbor via cardinal direction
+        } else {
+            # dest is numeric, so a tile id; transform dest tile id in q,r,s via tile query
+            $dst_q = $dm{$ct}->{$dest}->{'q_coord'};
+            $dst_r = $dm{$ct}->{$dest}->{'r_coord'};
+            $dst_s = 0 - $dst_q - $dst_r;
+            # run routing
+            my @pathfind = find_shortest_path($src_q, $src_r, $src_s, $dst_q, $dst_r, $dst_s);
+            push @route, @pathfind;
+        }
+    } else {
+        print "ERR-000: route_player(): internal error parsing player game object\n";
+        exit 1;
+    }
+    return \@route;
 }
 
 sub load_dm {
@@ -1172,6 +1274,7 @@ sub load_all_game_data {
 # General
 my $opt_help;
 my $opt_batch;
+my @opt_map;
 my $opt_mute;
 my @opt_player;
 my $opt_purge_cache;
@@ -1233,6 +1336,7 @@ GetOptions(
     # General options
     'help|h'            => \$opt_help,
     'batch|b'           => \$opt_batch,
+    'map=s{1}'          => \@opt_map,           # areaname|'all'
     'mute|m'            => \$opt_mute,
     'player|p'          => \@opt_player,        # playername
     'purge-cache'       => \$opt_purge_cache,
@@ -1254,7 +1358,7 @@ GetOptions(
     'detokenize=s{1}'   => \@opt_detokenize,    # asset (string e.g. "4.9542 FOOD")
     'dodropoff=s{2}'    => \@opt_dodropoff,     # item-quantity, item-type
     'doload=s{3}'       => \@opt_doload,        # vehicle-id, item-quantity, item-type
-    'domove=s{1}'       => \@opt_domove,        # tile-id
+    'domove=s{1}'       => \@opt_domove,        # tile-id|cardinal-direction
     'dopickup=s{2}'     => \@opt_dopickup,      # item-quantity, item-type
     'dounload=s{3}'     => \@opt_dounload,      # vehicle-id, item-quantity, item-type
     'joinfaction=s{1}'  => \@opt_joinfaction,   # faction-id
@@ -1309,17 +1413,22 @@ if ($opt_help) {
     print "General options:\n";
     print "  --batch, -b          Non-interactive mode: process all supplied options and exit\n";
     print "  --help, -h           Print this help and exit\n";
+    print "  --map <area>         Print map of area name; if area is 'all', dump all tiles\n";
     print "  --mute, -m           Suppress some important messages (e.g. wallet unlocking) for\n";
     print "                       easier reading; will not suppress errors or (most) prompts\n";
     print "  --player, -p <name>  Select player to play with (blockchain account name)\n";
     print "  --purge-cache        Clear players data dir cache (default: './$players_dir/')\n";
+    print "  --route <dest>       Provides a generic route (qrs hex routing) from the player's\n";
+    print "                       current tile to a tile-id (in the same area) or a cardinal\n";
+    print "                       direction (n,s,e,w,ne,se,nw,sw)\n";
     print "  --verbose, -v        Force verbose mode (for when it is disabled by batch mode)\n";
     print "\n";
     print "General options for development/debugging (temporary -- do not rely on these):\n";
+    print "  --cleos <cmd>        Pass non-transaction <cmd> string to cleos (NOTE: do not\n";
+    print "                       add --wallet-url, -u options; pldoh already adds them)\n";
+    print "  --cleostx <cmd>      Pass send-transaction <cmd> string to cleos (NOTE: do not\n";
+    print "                       add --wallet-url, -u, -p, -t & --use-old-send-rpc options)\n";
     print "  --tcn <v>            v=0: hgm/tcn; v=1: hg1/tc1; v=2: hg2/tc2\n";
-    print "  --cleostx <cmd>      Pass send-transaction <cmd> string to cleos\n";
-    print "  --cleos <cmd>        Pass non-transaction <cmd> string to cleos (NOTE: pldoh adds\n";
-    print "                       --wallet-url, -u, -p, -t & --use-old-send-rpc cleos options)\n";
     print "\n";
     print "Queries:\n";
     print "  --abi <c> [s]        Print ABI of contract c or specifics of item s of c; if c\n";
@@ -1344,7 +1453,7 @@ if ($opt_help) {
     print "  --detokenize <asset>        Blockchain asset (e.g. \"5.5000 FOOD\") to inventory\n";
     print "  --dodropoff <q> <i>         Drop quantity q of item i\n";
     print "  --doload <v> <i> <q>        Load quantity q of item i into vehicle v\n";
-    print "  --domove <t>                Move to tile id t\n";
+    print "  --domove <t>                Move to tile id or cardinal direction (n,s,ne,w..) t\n";
     print "  --dopickup <q> <i>          Pick up quantity q of item i\n";
     print "  --dounload <v> <i> <q>      Unload quantity q of item i from vehicle v\n";
     print "  --joinfaction <f>           Join faction id f\n";
@@ -1380,7 +1489,7 @@ if ($opt_help) {
 # If any intrinsically batch job or flag is provided (game query, game command, ...) we force batch mode.
 # If any option that sends transactions is called, we set txsign to 1
 
-if ($opt_batch || @opt_route
+if ($opt_batch || @opt_map || @opt_route
     || @opt_abi || @opt_query || @opt_squery || @opt_players
     )
 {
@@ -2102,7 +2211,13 @@ if (@opt_abi) {
                             $a_count++;
                         }
                     } else {
-                        print "    '$v'\n";
+                        if ($k eq $s || $s eq '.') {
+                            if (! $k_print) {
+                                print "  $k:\n";
+                                $k_print = 1;
+                            }
+                            print "    '$v'\n";
+                        }
                     }
                 }
             }
@@ -2110,75 +2225,106 @@ if (@opt_abi) {
     }
 }
 
-# --route <tile-id>
+# --map <area>
+
+if (@opt_map) {
+    my $area = $opt_map[0];
+    my $ct = "hegemon.${hgm}-tiles";
+    my @tiles;
+    if ($area eq 'all') {
+        print "tile q    r    s    area_map     re te fa factl wildn bu ve bp vp\n";
+    }
+    # Foreach tile, either dump it or add to a tiles-of-interest set (x,y,id only)
+    my $maxid = 0;
+    foreach my $value (values %{$dm{$ct}}) {
+        my $tile_area = $value->{'area_map'};
+        my $q = $value->{'q_coord'};
+        my $r = $value->{'r_coord'};
+        my $s = 0 - $q - $r;
+        my $id = $value->{'id'};
+        if ($area eq 'all') { # if all, just do a dump
+            my $region = $value->{'region_id'};
+            my $terrain = $value->{'terrain_type'};
+            my $faction = $value->{'control_faction'};
+            my $control = $value->{'control'};
+            my $wildness = $value->{'terrain_type'};
+            my $buildings = scalar(@{$value->{'buildings'}});
+            my $vehicles = scalar(@{$value->{'vehicles'}});
+            my $bproj = scalar(@{$value->{'building_projects'}});
+            my $vproj = scalar(@{$value->{'vehicle_projects'}});
+            print sprintf("%4d %4d %4d %4d %-12s %2d %2d %2d %5d %5d %2d %2d %2d %2d\n",
+                          $id, $q, $r, $s, $tile_area, $region, $terrain, $faction,
+                          $control, $wildness, $buildings, $vehicles, $bproj, $vproj);
+        } elsif ($tile_area eq $area) {
+            my $X = $q;
+            my $Y = $r * 2 + $q;
+            push @tiles, [$X, $Y, $id]; # if specific map, populate @tiles
+            $maxid = $id if $id > $maxid;
+        }
+    }
+    # if tiles-of-interest array was populated, print a graphical map
+    if (@tiles) {
+        my $width = length($maxid); # adapt grid to character width of printing largest tile ID
+        my ($minX, $minY, $maxX, $maxY) = (9999999, 9999999, -9999999, -9999999);
+        foreach my $tile (@tiles) {
+            my ($X, $Y) = @$tile[0, 1];
+            $minX = $X if $X < $minX;
+            $minY = $Y if $Y < $minY;
+            $maxX = $X if $X > $maxX;
+            $maxY = $Y if $Y > $maxY;
+        }
+        my @grid;
+        foreach my $tile (@tiles) {
+            my ($X, $Y, $id) = @$tile;
+            my $adjustedX = $X - $minX;
+            my $adjustedY = $Y - $minY;
+            $grid[$adjustedY][$adjustedX] = $id;
+        }
+        foreach my $y ($minY .. $maxY) {
+            foreach my $x ($minX .. $maxX) {
+                my $id = $grid[$y - $minY][$x - $minX];
+                my $formatted_id = defined($id) ? sprintf("%${width}d", $id) : " " x $width;
+                print sprintf(" %${width}s ", $formatted_id);
+            }
+            print "\n";
+        }
+    }
+}
+
+# --route <tile-id> or <direction>
 
 if (@opt_route) {
-    my $dest_tile_id = $opt_route[0];
+    my $dest = $opt_route[0];  # if number, tile id; if not, cardinal direction string
 
-    # fetch player record -- we already did, so use that.
-    my $obj = execute_player_hard_query();
+    my @route = @{route_player($dest)};
 
-    # get the tile id
-    # FIXME/TODO: need a thing that navigates the struct searching for fields with values.
-    #             then if it finds it, returns it, otherwise returns undef, so we don't
-    #             have to be doing manual checks.
-    if (exists $obj->{'rows'} && scalar @{$obj->{rows}} > 0 && exists $obj->{'rows'}->[0]->{'location_tile_id'}) {
+    # Dump the route, if any
+    if (@route) {
+        my $area = shift @route;
+        print "Player is in $area\n";
 
-        my $src_tile_id = $obj->{'rows'}->[0]->{'location_tile_id'};
+        my $first = "Source";
 
-        # NOTE: this is an interesting perl coding pattern
-        # my $element = $dm{'contract-table'}->[37] if $dm{'contract-table'} && scalar(@{$dm{'contract-table'}}) > 37;
-        my $ct = "hegemon.${hgm}-tiles";
+        foreach my $path (@route) {
 
-        # transform source tile id in q,r,s via tile query
-        my $src_q = $dm{$ct}->{$src_tile_id}->{'q_coord'};
-        my $src_r = $dm{$ct}->{$src_tile_id}->{'r_coord'};
-        my $src_s = - $src_q - $src_r;
+            # get the tile id of the next step in the route by searching the entire tile store
+            #   for matching q,r,s coords. FIXME/TODO: do something better than a brute force search
+            #   in a flat data dump (i.e. sort tiles with various client-side indices in the data model).
 
-        # transform dest tile id in q,r,s via tile query
-        my $dst_q = $dm{$ct}->{$dest_tile_id}->{'q_coord'};
-        my $dst_r = $dm{$ct}->{$dest_tile_id}->{'r_coord'};
-        my $dst_s = - $dst_q - $dst_r;
+            my $path_tile_id = get_tile_id_by_qrsa($path->[0], $path->[1], $path->[2], $area);
 
-        $src_tile_id = sprintf("%4d", $src_tile_id);
-        print "Source [Tile id: $src_tile_id]: ($src_q, $src_r, $src_s)\n";
-
-        # run route
-        my @route = find_shortest_path($src_q, $src_r, $src_s, $dst_q, $dst_r, $dst_s);
-        if (@route) {
-            foreach my $path (@route) {
-
-                # get the tile id of the next step in the route by searching the entire tile store
-                #   for matching q,r,s coords. FIXME/TODO: do something better than a brute force search
-                #   in a flat data dump (i.e. sort tiles with various client-side indices in the data model).
-
-                my $path_tile_id = "ERROR: NOT FOUND";
-                #while (my ($key, $value) = each %{$dm{$ct}}) {  # <--- this DOES NOT WORK (non-deterministic error) for some reason. "unintended side effects of 'each'"
-                # What a piece of junk. FIXME/TODO: get rid of every usage of 'each'
-                #https://blogs.perl.org/users/rurban/2014/04/do-not-use-each.html
-                foreach my $value (values %{$dm{$ct}}) {
-                    my $path_q = $value->{'q_coord'};
-                    my $path_r = $value->{'r_coord'};
-                    my $path_s = - $path_q - $path_r;
-                    if ($path_q == $path->[0] &&
-                        $path_r == $path->[1] &&
-                        $path_s == $path->[2]
-                        )
-                    {
-                        $path_tile_id = $value->{'id'}; #$key, if we had it
-                        last;
-                    }
-                }
-
+            if (! defined $path_tile_id) {
+                $path_tile_id = " ???";
+            } else {
                 $path_tile_id = sprintf("%4d", $path_tile_id);
-                print "       [Tile id: $path_tile_id]: (". $path->[0] . ", " . $path->[1] . ", " . $path->[2] . ")\n";
             }
+
+            print "$first [Tile id: $path_tile_id]: (". $path->[0] . ", " . $path->[1] . ", " . $path->[2] . ")\n";
+            $first = '      ';
         }
-    } else {
-        print "ERR-000: Malformed player object found while executing --route\n";
-        exit 1;
     }
 }
+
 
 # Table queries
 
@@ -2243,7 +2389,29 @@ if ($opt_createchar)   { run_batch_command("createchar '{\"player\":\"$player\"}
 if (@opt_detokenize)   { run_batch_command("detokenize '{\"player\":\"$player\", \"quantity\":\"$opt_detokenize[0]\"}'"); }
 if (@opt_dodropoff)    { run_batch_command("dodropoff '{\"player\":\"$player\", \"items\":[$opt_dodropoff[0], $opt_dodropoff[1]]}'"); }
 if (@opt_doload)       { run_batch_command("doload '{\"player\":\"$player\", \"vehicle_id\":\"$opt_doload[0]\", \"items\":[$opt_doload[1], $opt_doload[2]]}'"); }
-if (@opt_domove)       { run_batch_command("domove '{\"player\":\"$player\", \"destination_tile_id\":\"$opt_domove[0]\"}'"); }
+if (@opt_domove)       {
+    my $dest = $opt_domove[0];
+    if (! looks_like_number($dest)) {  # if dest is n,s,ne,sw,etc. instead of tile id, we must translate it to tile id first
+        my @route = @{ route_player($dest) };
+        my $area = shift @route;
+        my $src_ref = shift @route;
+        my $dst_ref = shift @route;
+        if (! defined $dst_ref) {
+            print "ERR-000: --domove: internal error trying to route to cardinal direction '$dest'\n";
+            exit 1;
+        } else {
+            my $dst_q = $dst_ref->[0];
+            my $dst_r = $dst_ref->[1];
+            my $dst_s = $dst_ref->[2];
+            $dest = get_tile_id_by_qrsa($dst_q, $dst_r, $dst_s, $area);
+            if (! defined $dest) {
+                print "ERR-000: --domove: error finding tile id for ($dst_q, $dst_r, $dst_s) for '$area'\n";
+                exit 1;
+            }
+        }
+    }
+    run_batch_command("domove '{\"player\":\"$player\", \"destination_tile_id\":\"$dest\"}'");
+}
 if (@opt_dopickup)     { run_batch_command("dopickup '{\"player\":\"$player\", \"items\":[$opt_dopickup[0], $opt_dopickup[1]]}'"); }
 if (@opt_dounload)     { run_batch_command("dounload '{\"player\":\"$player\", \"vehicle_id\":\"$opt_dounload[0]\", \"items\":[$opt_dounload[1], $opt_dounload[2]]}'"); }
 if (@opt_joinfaction)  { run_batch_command("joinfaction '{\"player\":\"$player\", \"faction_id\":\"$opt_joinfaction[0]\"}'"); }
