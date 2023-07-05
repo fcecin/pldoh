@@ -29,7 +29,7 @@
 # - LATER: make --abi output prettier (more compact; with more insight on e.g. action parameters and
 #          struct field formatting, and all other elements)
 #
-# - LATER: add politics AND staking to batch play commands
+# - LATER: add staking to batch play commands
 #
 # - LATER: think about the code duplication between interactive mode and batch mode (e.g. cleos push action doeng x 2)
 #   see if there's common code that can be replaced by subs that are common to both -- or ONE sub that knows how
@@ -915,6 +915,12 @@ sub run_batch_query {
         {
             $contract = "staking.${tcn}";
         }
+        elsif ($table eq 'playernames' ||
+               $table eq 'charnames'
+            )
+        {
+            $contract = "names.${hgm}";
+        }
         else
         {
             $contract = "hegemon.${hgm}"; # assume it's the hegemon contract by default
@@ -1331,6 +1337,20 @@ my @opt_revivechar;
 # update -- doesn't seem implemented yet
 my @opt_upgradechar;
 
+# Politics cmds:
+my @opt_propose;
+my @opt_voteprop;
+my @opt_unvoteprop;
+my @opt_addcandidacy;
+my @opt_remcandidacy;
+my @opt_setvotes;
+#my @opt_endorse; # (contract WIP--TODO:revisit) [auth:player]
+#creategroup -- admin/etc.
+#removegroup -- admin/etc.
+#stakechange -- admin/etc.
+#factioncheck -- admin/etc.
+
+
 # Define command-line options
 GetOptions(
     # General options
@@ -1386,7 +1406,15 @@ GetOptions(
     'doresearch=s{1}'   => \@opt_doresearch,    # character-id
     'dounequip=s{2}'    => \@opt_dounequip,     # character-id, gameasset-id
     'revivechar=s{1}'   => \@opt_revivechar,    # character-id  (+current player is the payer)
-    'upgradechar=s{2}'  => \@opt_upgradechar    # character-id, new-role-id
+    'upgradechar=s{2}'  => \@opt_upgradechar,   # character-id, new-role-id
+
+    # Politics commands
+    'propose=s{4}'      => \@opt_propose,       # voter(player) group_id leader "rank1 rank2 rank3 ..." [auth:voter]
+    'voteprop=s{2}'     => \@opt_voteprop,      # voter(player) proposal_id [auth:voter]
+    'unvoteprop=s{2}'   => \@opt_unvoteprop,    # voter(player) proposal_id [auth:voter]
+    'addcandidacy=s{1}' => \@opt_addcandidacy,  # character_id [auth:char->owner]
+    'remcandidacy=s{1}' => \@opt_remcandidacy,  # character_id [auth:char->owner]
+    'setvotes=s{2}'     => \@opt_setvotes       # player "candidate_id1 candidateid_2 candidateid_3 ..." [auth:player]
 
 ) or die "ERR-999: Error in command line arguments\n";
 
@@ -1482,6 +1510,16 @@ if ($opt_help) {
     print "  --dounequip <c> <g>         Char c unequips gameasset id g\n";
     print "  --revivechar <c>            Revive char c (costs 1 CLONE)\n";
     print "  --upgradechar <c> <r>       Upgrade char c to role id r\n";
+    print "\n";
+    print "Politics commands:\n";
+    print "  --addcandidacy <c>          [c]haracter id\n";
+    print "  --propose <v> <g> <l> <r>   [v]oter, [g]roup id, [l]eader, [r]anks\n";
+    print "                              v and l are player account names\n";
+    print "                              r is a space-separated list of names (use \"\")\n";
+    print "  --remcandidacy <c>          [c]haracter id\n";
+    print "  --setvotes <p> <c>          [p]layer, [c]andidates (candidate ids list; use \"\")\n";
+    print "  --unvoteprop <v> <p>        [v]oter, [p]roposal id\n";
+    print "  --voteprop <v> <p>          [v]oter, [p]roposal id\n";
     print "\n";
     exit 1;
 }
@@ -2441,6 +2479,38 @@ if (@opt_doresearch)   { run_batch_command("doresearch '{\"character_id\":\"$opt
 if (@opt_dounequip)    { run_batch_command("dounequip '{\"character_id\":\"$opt_dounequip[0]\", \"gameasset_id\":\"$opt_dounequip[1]\"}'"); }
 if (@opt_revivechar)   { run_batch_command("revivechar '{\"character_id\":\"$opt_revivechar[0]\", \"payer\":\"$player\"}'"); }
 if (@opt_upgradechar)  { run_batch_command("upgradechar '{\"character_id\":\"$opt_upgradechar[0]\", \"new_role\":\"$opt_upgradechar[1]\"}'"); }
+
+# Politics commands
+
+if (@opt_propose) {       # voter(player) group_id leader "rank1 rank2 rank3 ..." [auth:voter]
+    print "ERROR: NOT IMPLEMENTED\n";
+    exit 1;
+}
+
+if (@opt_voteprop) {      # voter(player) proposal_id [auth:voter]
+    print "ERROR: NOT IMPLEMENTED\n";
+    exit 1;
+}
+
+if (@opt_unvoteprop) {    # voter(player) proposal_id [auth:voter]
+    print "ERROR: NOT IMPLEMENTED\n";
+    exit 1;
+}
+
+if (@opt_addcandidacy) {  # character_id [auth:char->owner]
+    print "ERROR: NOT IMPLEMENTED\n";
+    exit 1;
+}
+
+if (@opt_remcandidacy) {  # character_id [auth:char->owner]
+    print "ERROR: NOT IMPLEMENTED\n";
+    exit 1;
+}
+
+if (@opt_setvotes) {      # player "candidate_id1 candidateid_2 candidateid_3 ..." [auth:player]
+    print "ERROR: NOT IMPLEMENTED\n";
+    exit 1;
+}
 
 # --------------------------------------------------------------------------------------------
 # If menu mode, enter menu loop (otherwise exit)
