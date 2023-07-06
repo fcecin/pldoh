@@ -1307,6 +1307,7 @@ my $opt_mute;
 my @opt_nopolitics;
 my @opt_player;
 my $opt_purge_cache;
+my $opt_regplayer;
 my @opt_route;
 my $opt_verbose;
 my @opt_tcn;
@@ -1384,6 +1385,7 @@ GetOptions(
     'nopolitics=s{1}'   => \@opt_nopolitics,    # 'false'|'true'
     'p|player=s{1}'     => \@opt_player,        # playername
     'purge-cache'       => \$opt_purge_cache,
+    'regplayer'         => \$opt_regplayer,
     'route=s{1}'        => \@opt_route,         # destination-tile-id
     'verbose|v'         => \$opt_verbose,
     'tcn=s{1}'          => \@opt_tcn,           # [0,1,2]
@@ -1471,6 +1473,7 @@ if ($opt_help) {
     print "  --nopolitics <v>     Auto opt in or out of politics; v is 'false' or 'true'\n";
     print "  --player, -p <name>  Select player to play with (blockchain account name)\n";
     print "  --purge-cache        Clear players data dir cache (default: './$players_dir/')\n";
+    print "  --regplayer          Force registration of selected player if necessary\n";
     print "  --route <dest>       Provides a generic route (qrs hex routing) from the player's\n";
     print "                       current tile to a tile-id (in the same area) or a cardinal\n";
     print "                       direction (n,s,e,w,ne,se,nw,sw)\n";
@@ -1559,12 +1562,17 @@ if ($opt_batch || @opt_map || @opt_route
     $menu = 0;
 }
 
-if (@opt_cleos || @opt_cleostx   # will potentially need it, so just require it, to simplify (dev options anyway)
+if (@opt_cleos || @opt_cleostx    # will potentially need it, so just require it, to simplify (dev options anyway)
     || $opt_createchar || @opt_detokenize || @opt_dodropoff || @opt_doload || @opt_domove || @opt_dopickup || @opt_dounload || @opt_joinfaction || @opt_tokenize
     || @opt_doaddmats || @opt_doaddproj || @opt_dobuild || @opt_docancelproj || @opt_docivil || @opt_docommerce || @opt_docraft || @opt_dodisembark || @opt_doeat || @opt_doembark || @opt_doeng || @opt_doequip || @opt_dofarming || @opt_dohealth || @opt_dointel || @opt_dologis || @opt_domilitary || @opt_domining || @opt_doresearch || @opt_dounequip || @opt_revivechar || @opt_upgradechar
    )
 {
     $menu = 0;
+    $txsign = 1;
+}
+
+# Special case: forcing a player registration check; don't change whatever menu mode is already selected, but we may need to sign a transaction
+if ($opt_regplayer) {
     $txsign = 1;
 }
 
@@ -2047,7 +2055,7 @@ if ($api eq '') {
 # In interactive (menu) mode, test API and offer to regplayer if necessary
 # --------------------------------------------------------------------------------------------
 
-# Interactive (menu) mode only.
+# Interactive (menu) mode only -- OR if forcing a player registration check
 #
 # This is the only hard query we make; all others will be mediated by the table cache.
 # In interactive mode, we want to test the API node before we start asking for passwords etc.
@@ -2056,7 +2064,7 @@ if ($api eq '') {
 # This also allows us to detect that the blockchain account isn't regplayer'ed and offer to
 #   do that for the user.
 
-if ($menu) {
+if ($menu || $opt_regplayer) {
 
     my $obj = execute_player_hard_query();
 
@@ -2084,7 +2092,7 @@ if ($menu) {
         my $oopbool;
         if (defined $no_politics) {
             $oopbool = $no_politics; # $nopolitics is already validated to be either 'false' or 'true'
-            if ($verbose) {
+            if (! $mute) {
                 print "Selected blockchain account '$player' is not registered in DoH as a game player.\n";
                 print "Registering account as a player automatically since nopolitics option is set (to '$no_politics')...\n";
             }
@@ -2122,17 +2130,18 @@ if ($menu) {
         # Attempt to regplayer
 
         my $regplayer_cmd = "$cleos -u $api push action hegemon.${hgm} regplayer '{\"player\":\"$player\", \"opt_out_of_politics\":$oopbool}' -p $player $old_rpc_postfix $postfix";
-        print "Command: $regplayer_cmd\n";
+
+        if (! $mute) { print "Command: $regplayer_cmd\n"; }
         $o = `$regplayer_cmd`;
         if ($? != 0) {
-            if (! check_authorization_error($o)) {
+            if (! check_authorization_error($o)) { 
                 print "Result: $o\n";
                 print "ERR-010: Can't regplayer (unknown reason).\n";
             }
             exit 1;
         }
 
-        print "Player registration request command submitted. Querying player table to check if it's all right.";
+        if (! $mute) { print "Player registration request command submitted. Querying player table to check if it's all right.\n"; }
 
         $obj = execute_player_hard_query();
 
@@ -2146,7 +2155,7 @@ if ($menu) {
             $need_auth_check = 0;
             # All good: player's blockchain account has called regplayer.
             # Found one player object with $player account as its owner.
-            print "One player record found (player seems to be registered).\n";
+            if (! $mute) { print "One player record found (player seems to be registered).\n"; }
         } elsif ($row_count == 0) {
             print "ERR-011: No player record found; regplayer seems to have failed.\n";
             exit 1;
