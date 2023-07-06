@@ -1,0 +1,61 @@
+#!/usr/bin/perl
+
+use strict;
+use warnings;
+
+# Get command line arguments
+my $pattern = shift @ARGV;
+my $count = shift @ARGV;
+my $command = shift @ARGV;
+
+if (!defined $command) {
+    print "run4acc <'aaaaaa' starting pattern> <count> <command> [dry-run]\n";
+    print "  enter any value for dry-run to activate it\n";
+    print "  use ## inside the command to substitute for the patttern\n";
+    exit 1;
+}
+
+if (! ($command =~ /##/)) {
+    print "The command string does not contain '##' at least once:\n$command\n";
+    exit 1;
+}
+
+my $dryrun = shift @ARGV;
+
+# Convert pattern to array of characters
+my @chars = split //, $pattern;
+
+# Loop for the specified count
+for (my $i = 0; $i < $count; $i++) {
+    # Construct the new pattern
+    my $new_pattern = join '', @chars;
+
+    # Execute the command with the new pattern
+    my $cmd = $command;
+    $cmd =~ s/##/$new_pattern/g;
+    print "Executing command: $cmd\n";
+
+    if (! defined $dryrun) {
+        my $exit_status = system($cmd);
+        if ($exit_status == 0) {
+            print "Command executed successfully.\n";
+        } else {
+            my $error_code = $exit_status >> 8; # Extract the error code from the exit status
+            print "Command returned an error. Error code: $error_code\n";
+            exit 1;
+        }
+    }
+    
+    # Increment the pattern for the next iteration
+    my $idx = scalar(@chars) - 1;
+    while ($idx >= 0) {
+        my $ord = ord($chars[$idx]) + 1;
+        if ($ord > ord('z')) {
+            $chars[$idx] = 'a';
+            $idx--;
+        } else {
+            $chars[$idx] = chr($ord);
+            last;
+        }
+    }
+}
