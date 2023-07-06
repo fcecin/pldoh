@@ -529,6 +529,8 @@ my $cleos = "cleos --wallet-url unix://./keosd.sock";
 # Utilities
 # --------------------------------------------------------------------------------------------
 
+sub get_politics { return "politics.${hgm}"; }
+
 # Check valid Antelope account name
 sub valid_name {
     my $str = shift;
@@ -870,12 +872,14 @@ sub pack_dump_str {   # fix a JSON dump string for printing in a small window
 }
 
 sub run_batch_command {
-    my $action = shift;
+    my $action = shift;     # param 1: action name & params in JSON format
+    my $contract = shift;   # param 2: (optional) contract name
     if (! defined $action) {
         print "ERROR: run_batch_command() called without action string.\n";
         exit 1;
     }
-    my $cmd = "$cleos -u $api push action hegemon.${hgm} $action -p $player $old_rpc_postfix $postfix";
+    if (! defined $contract) { $contract = "hegemon.${hgm}"; } # default contract is hegemon
+    my $cmd = "$cleos -u $api push action $contract $action -p $player $old_rpc_postfix $postfix";
     print "Executing: $cmd\n";
     $o = `$cmd`;
     if ($o) {
@@ -918,7 +922,7 @@ sub run_batch_query {
                $table eq 'proposals'
             )
         {
-            $contract = "politics.${hgm}";
+            $contract = get_politics();
         }
         elsif ($table eq 'stglobal' ||
                $table eq 'targets' ||
@@ -1269,7 +1273,7 @@ sub load_all_game_data {
     my @contracts_to_load_abi =
         (
          "hegemon.${hgm}",
-         "politics.${hgm}",
+         get_politics(),
          "crafting.${hgm}",
          "names.${hgm}",
          "staking.${tcn}"
@@ -1565,6 +1569,8 @@ if ($opt_batch || @opt_map || @opt_route
 if (@opt_cleos || @opt_cleostx    # will potentially need it, so just require it, to simplify (dev options anyway)
     || $opt_createchar || @opt_detokenize || @opt_dodropoff || @opt_doload || @opt_domove || @opt_dopickup || @opt_dounload || @opt_joinfaction || @opt_tokenize
     || @opt_doaddmats || @opt_doaddproj || @opt_dobuild || @opt_docancelproj || @opt_docivil || @opt_docommerce || @opt_docraft || @opt_dodisembark || @opt_doeat || @opt_doembark || @opt_doeng || @opt_doequip || @opt_dofarming || @opt_dohealth || @opt_dointel || @opt_dologis || @opt_domilitary || @opt_domining || @opt_doresearch || @opt_dounequip || @opt_revivechar || @opt_upgradechar
+    || @opt_propose || @opt_voteprop || @opt_unvoteprop || @opt_addcandidacy || @opt_remcandidacy || @opt_setvotes
+
    )
 {
     $menu = 0;
@@ -2445,7 +2451,7 @@ if (@opt_contract) {
 }
 
 if (@opt_squery) {
-    my @batch_query_args = @opt_query;  # does a deep copy, since everything is a scalar
+    my @batch_query_args = @opt_squery;  # does a deep copy, since everything is a scalar
 
     # if first argument is NOT numeric, then we have to insert the default index (1)
     if (!looks_like_number($batch_query_args[0])) {
@@ -2528,38 +2534,38 @@ if (@opt_joinfaction)  { run_batch_command("joinfaction '{\"player\":\"$player\"
 if (@opt_tokenize)     { run_batch_command("tokenize '{\"player\":\"$player\", \"quantity\":\"$opt_tokenize[0]\"}'"); }
 
 # Character commands
-
+#ACT_MIN = 1;#ACT_MAX = 10;#ACT_MINING = 1;#ACT_ENGINEERING = 2;#ACT_FARMING = 3;#ACT_LOGISTICS = 4;#ACT_HEALTH_CARE = 5;#ACT_COMMERCE = 6;#ACT_CIVIL_SERVICE = 7;#ACT_INTELLIGENCE = 8;#ACT_MILITARY = 9;#ACT_RESEARCH = 10;
 if (@opt_doaddmats)    { run_batch_command("doaddmats '{\"character_id\":\"$opt_doaddmats[0]\", \"project_id\":\"$opt_doaddmats[1]\", \"materials\":[$opt_doaddmats[2], $opt_doaddmats[3]]}'"); }
 if (@opt_doaddproj)    { run_batch_command("doaddproj '{\"character_id\":\"$opt_doaddproj[0]\", \"blueprint_id\":\"$opt_doaddproj[1]\"}'"); }
 if (@opt_dobuild)      { run_batch_command("dobuild '{\"character_id\":\"$opt_dobuild[0]\", \"project_id\":\"$opt_dobuild[1]\"}'"); }
 if (@opt_docancelproj) { run_batch_command("docancelproj '{\"character_id\":\"$opt_docancelproj[0]\", \"project_id\":\"$opt_docancelproj[1]\"}'"); }
-if (@opt_docivil)      { run_batch_command("docivil '{\"character_id\":\"$opt_docivil[0]\"}'"); }
-if (@opt_docommerce)   { run_batch_command("docommerce '{\"character_id\":\"$opt_docommerce[0]\"}'"); }
+if (@opt_docivil)      { run_batch_command("dowork '{\"character_id\":\"$opt_docivil[0]\",\"activity\":7}'"); }
+if (@opt_docommerce)   { run_batch_command("dowork '{\"character_id\":\"$opt_docommerce[0]\",\"activity\":6}'"); }
 if (@opt_docraft)      { run_batch_command("docraft '{\"character_id\":\"$opt_docraft[0]\", \"recipe_id\":\"$opt_docraft[1]\"}'"); }
 if (@opt_dodisembark)  { run_batch_command("dodisembark '{\"character_id\":\"$opt_dodisembark[0]\"}'"); }
 if (@opt_doeat)        { run_batch_command("doeat '{\"character_id\":\"$opt_doeat[0]\"}'"); }
 if (@opt_doembark)     { run_batch_command("doembark '{\"character_id\":\"$opt_doembark[0]\", \"vehicle_id\":\"$opt_doembark[1]\"}'"); }
-if (@opt_doeng)        { run_batch_command("doeng '{\"character_id\":\"$opt_doeng[0]\"}'"); }
+if (@opt_doeng)        { run_batch_command("dowork '{\"character_id\":\"$opt_doeng[0]\",\"activity\":2}'"); }
 if (@opt_doequip)      { run_batch_command("doequip '{\"character_id\":\"$opt_doequip[0]\", \"gameasset_id\":\"$opt_doequip[1]\"}'"); }
-if (@opt_dofarming)    { run_batch_command("dofarming '{\"character_id\":\"$opt_dofarming[0]\"}'"); }
-if (@opt_dohealth)     { run_batch_command("dohealth '{\"character_id\":\"$opt_dohealth[0]\"}'"); }
-if (@opt_dointel)      { run_batch_command("dointel '{\"character_id\":\"$opt_dointel[0]\"}'"); }
-if (@opt_dologis)      { run_batch_command("dologis '{\"character_id\":\"$opt_dologis[0]\"}'"); }
-if (@opt_domilitary)   { run_batch_command("domilitary '{\"character_id\":\"$opt_domilitary[0]\"}'"); }
-if (@opt_domining)     { run_batch_command("domining '{\"character_id\":\"$opt_domining[0]\"}'"); }
-if (@opt_doresearch)   { run_batch_command("doresearch '{\"character_id\":\"$opt_doresearch[0]\"}'"); }
+if (@opt_dofarming)    { run_batch_command("dowork '{\"character_id\":\"$opt_dofarming[0]\",\"activity\":3}'"); }
+if (@opt_dohealth)     { run_batch_command("dowork '{\"character_id\":\"$opt_dohealth[0]\",\"activity\":5}'"); }
+if (@opt_dointel)      { run_batch_command("dowork '{\"character_id\":\"$opt_dointel[0]\",\"activity\":8}'"); }
+if (@opt_dologis)      { run_batch_command("dowork '{\"character_id\":\"$opt_dologis[0]\",\"activity\":4}'"); }
+if (@opt_domilitary)   { run_batch_command("dowork '{\"character_id\":\"$opt_domilitary[0]\",\"activity\":9}'"); }
+if (@opt_domining)     { run_batch_command("dowork '{\"character_id\":\"$opt_domining[0]\",\"activity\":1}'"); }
+if (@opt_doresearch)   { run_batch_command("dowork '{\"character_id\":\"$opt_doresearch[0]\",\"activity\":10}'"); }
 if (@opt_dounequip)    { run_batch_command("dounequip '{\"character_id\":\"$opt_dounequip[0]\", \"gameasset_id\":\"$opt_dounequip[1]\"}'"); }
 if (@opt_revivechar)   { run_batch_command("revivechar '{\"character_id\":\"$opt_revivechar[0]\", \"payer\":\"$player\"}'"); }
 if (@opt_upgradechar)  { run_batch_command("upgradechar '{\"character_id\":\"$opt_upgradechar[0]\", \"new_role\":\"$opt_upgradechar[1]\"}'"); }
 
 # Politics commands
 
-if (@opt_propose) { run_batch_command("propose '{\"voter\":\"$opt_propose[0]\", \"group_id\":\"$opt_propose[1]\", \"leader\":\"$opt_propose[2]\", \"ranks\":\"$opt_propose[3]\"}'"); }
-if (@opt_voteprop) { run_batch_command("voteprop '{\"voter\":\"$opt_voteprop[0]\", \"proposal_id\":\"$opt_voteprop[1]\"}'"); }
-if (@opt_unvoteprop) { run_batch_command("unvoteprop '{\"voter\":\"$opt_unvoteprop[0]\", \"proposal_id\":\"$opt_unvoteprop[1]\"}'"); }
-if (@opt_addcandidacy) { run_batch_command("addcandidacy '{\"character_id\":\"$opt_addcandidacy[0]\"}'"); }
-if (@opt_remcandidacy) { run_batch_command("remcandidacy '{\"character_id\":\"$opt_remcandidacy[0]\"}'"); }
-if (@opt_setvotes) { run_batch_command("setvotes '{\"player\":\"$opt_setvotes[0]\", \"candidates\":\"$opt_setvotes[1]\"}'"); }
+if (@opt_propose) { run_batch_command("propose '{\"voter\":\"$opt_propose[0]\", \"group_id\":\"$opt_propose[1]\", \"leader\":\"$opt_propose[2]\", \"ranks\":\"$opt_propose[3]\"}'", get_politics()); }
+if (@opt_voteprop) { run_batch_command("voteprop '{\"voter\":\"$opt_voteprop[0]\", \"proposal_id\":\"$opt_voteprop[1]\"}'", get_politics()); }
+if (@opt_unvoteprop) { run_batch_command("unvoteprop '{\"voter\":\"$opt_unvoteprop[0]\", \"proposal_id\":\"$opt_unvoteprop[1]\"}'", get_politics()); }
+if (@opt_addcandidacy) { run_batch_command("addcandidacy '{\"character_id\":\"$opt_addcandidacy[0]\"}'", get_politics()); }
+if (@opt_remcandidacy) { run_batch_command("remcandidacy '{\"character_id\":\"$opt_remcandidacy[0]\"}'", get_politics()); }
+if (@opt_setvotes) { run_batch_command("setvotes '{\"player\":\"$opt_setvotes[0]\", \"candidates\":$opt_setvotes[1]}'", get_politics()); }
 
 # --------------------------------------------------------------------------------------------
 # If menu mode, enter menu loop (otherwise exit)
