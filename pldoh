@@ -441,9 +441,12 @@ my $chain_api_key = "chain-api";
 my $player_key = "player";
 my $need_auth_check_key = "need-auth-check";
 my $tcn_key = "tcn"; # set to 0, 1 or 2  (hgm/tcn , hg1/tc1 , hg2/tc2)
+my $nopolitics_key = "nopolitics";
 
 my $players_dir = "p";   # default name for the subdirectory that contains account-name
                          #   (player-name) subdirectories
+
+my $global_data_dir = "_global"; # p/_global/ gets global data (not a player dir)
 
 my $forever_seconds = 31536000;   # one year -- cache retention for load_dm() game content
 
@@ -453,6 +456,8 @@ my $force_query_contract = '';   # forced FULL contract name (prefix AND suffix,
 
 my $player = '';  # selected player account to play with (default empty = none is defined)
 my $player_data_dir = ''; # computed later
+
+my $no_politics; # will be left undefined, or explicitly set to string value 'false' or 'true'; to avoid politics prompt
 
 my $api = ''; # selected API node URL (default empty = none is defined)
 
@@ -800,7 +805,11 @@ sub get_table {
     my $query_str = "$cleos -u $api get table $contract $scope $table $selector $postfix";
 
     # Relative cache location on disk for the result of this query
-    my $cache_item = "$player/$contract_table/_$selector";
+    #my $cache_item = "$player/$contract_table/_$selector";
+    #
+    # We don't want the cache to be per player, really
+    #
+    my $cache_item = "$global_data_dir/$contract_table/_$selector";
 
     # Run back-end code (shared with get table and get abi)
     return get_cache($query_str, $cache_item, $cache_expiration_s, $debug);
@@ -826,7 +835,11 @@ sub get_abi {
     my $query_str = "$cleos -u $api get abi $contract $postfix";
 
     # Relative cache location on disk for the result of this query
-    my $cache_item = "$player/$contract/_ABI";
+    #my $cache_item = "$player/$contract/_ABI";
+    #
+    # We don't want the cache to be per player, really
+    #
+    my $cache_item = "$global_data_dir/$contract/_ABI";
 
     # Run back-end code (shared with get table and get abi)
     return get_cache($query_str, $cache_item, $cache_expiration_s, $debug);
@@ -979,7 +992,7 @@ sub set_hgm_tcn {
 sub set_player {
     $player = shift;
     if (! valid_name($player)) {
-        print "ERR-000: Invalid account name given to --player: '$player'\n";
+        print "ERR-000: Invalid account name given to player option: '$player'\n";
         exit 1;
     }
     if ($verbose) { print "Player set to '$player'.\n"; }
@@ -1270,6 +1283,15 @@ sub load_all_game_data {
     }
 }
 
+sub set_nopolitics {
+    $no_politics = shift;
+    if (!defined $no_politics || ($no_politics ne 'false' && $no_politics ne 'true')) {
+        print "ERR-000: Invalid Nopolitics option; must be 'false' or 'true'\n";
+        exit 1;
+    }
+    if ($verbose) { print "Nopolitics set to '$no_politics'.\n"; }
+}
+
 # --------------------------------------------------------------------------------------------
 # Parse command-line arguments
 # --------------------------------------------------------------------------------------------
@@ -1282,6 +1304,7 @@ my $opt_help;
 my $opt_batch;
 my @opt_map;
 my $opt_mute;
+my @opt_nopolitics;
 my @opt_player;
 my $opt_purge_cache;
 my @opt_route;
@@ -1358,7 +1381,8 @@ GetOptions(
     'batch|b'           => \$opt_batch,
     'map=s{1}'          => \@opt_map,           # areaname|'all'
     'mute|m'            => \$opt_mute,
-    'player|p'          => \@opt_player,        # playername
+    'nopolitics=s{1}'   => \@opt_nopolitics,    # 'false'|'true'
+    'p|player=s{1}'     => \@opt_player,        # playername
     'purge-cache'       => \$opt_purge_cache,
     'route=s{1}'        => \@opt_route,         # destination-tile-id
     'verbose|v'         => \$opt_verbose,
@@ -1444,6 +1468,7 @@ if ($opt_help) {
     print "  --map <area>         Print map of area name; if area is 'all', dump all tiles\n";
     print "  --mute, -m           Suppress some important messages (e.g. wallet unlocking) for\n";
     print "                       easier reading; will not suppress errors or (most) prompts\n";
+    print "  --nopolitics <v>     Auto opt in or out of politics; v is 'false' or 'true'\n";
     print "  --player, -p <name>  Select player to play with (blockchain account name)\n";
     print "  --purge-cache        Clear players data dir cache (default: './$players_dir/')\n";
     print "  --route <dest>       Provides a generic route (qrs hex routing) from the player's\n";
@@ -1587,6 +1612,9 @@ if (@opt_player) { set_player($opt_player[0]); }
 
 # Deal with --purge-cache now, since it affects reading objects and such
 if ($opt_purge_cache) { purge_cache(); }
+
+# Deal with --nopolitics
+if (@opt_nopolitics) { set_nopolitics($opt_nopolitics[0]); }
 
 # --------------------------------------------------------------------------------------------
 # Resolve cleos and keosd
@@ -1790,6 +1818,14 @@ while (my $line = <$fh>) {
     if ($key eq $tcn_key) {
         set_hgm_tcn($value);
     }
+
+    if ($key eq $nopolitics_key) {
+        if (defined $no_politics) {
+            if ($verbose) { print "    no_politics already set via --nopolitics; ignoring.\n"; }
+        } else {
+            set_nopolitics($value);
+        }
+    }
 }
 close($fh);
 
@@ -1810,15 +1846,29 @@ unless (-d $players_dir) {
     if ($verbose) { print "Found player store: $RealBin/$players_dir\n"; }
 }
 
+# A fake "player" that we add to the player data directory is the "_global" player
+$o = "$players_dir/$global_data_dir";
+unless (-d $o) {
+    mkdir $o or die "Failed to   create global data store ./$o: $!";
+    if (! $mute) { print "Created global data store: $RealBin/$o\n"; }
+} else {
+    if ($verbose) { print "Found global data store: $RealBin/$o\n"; }
+}
+
 # Scan subdirectory names (all player names we are playing with)
 opendir my $dh, $players_dir or die "Failed to open directory $players_dir: $!";
 my @players = grep { -d File::Spec->catdir($players_dir, $_) && !/^\./ } readdir $dh;
 closedir $dh;
 
-# Resolve/select player name and player data dir
-if (scalar(@players) == 0) {
+# remove the _global data directory from the list
+@players = grep { $_ ne $global_data_dir } @players;
 
-    my $player_input = $player eq '';
+# This is false if --player xxx or player = xxx in pldoh.ini; means we do the same as if
+#   we had to get the player name from stdin, except we already have the input.
+my $player_input = $player eq '';
+
+# Resolve/select player name and player data dir
+if (!$player_input || scalar(@players) == 0) {
 
     # if default player name not provided, ask for it
     if ($player_input) {
@@ -1845,9 +1895,12 @@ if (scalar(@players) == 0) {
 
     $player_data_dir = "$players_dir/$player";
 
-    mkdir $player_data_dir or die "Failed to create directory $player_data_dir: $!";
-
-    print "Created player data directory: $player_data_dir\n";
+    if (-e $player_data_dir) {
+        if ($verbose) { print "Player data dir already exists: $player_data_dir\n"; }
+    } else {
+        mkdir $player_data_dir or die "Failed to create directory $player_data_dir: $!";
+        if ($verbose || $player_input) { print "Created player data directory: $player_data_dir\n"; }
+    }
 
 } else {
 
@@ -2025,67 +2078,77 @@ if ($menu) {
         # Need to regplayer. Offer to do it for the user.
         # All this is printed since it's falling back into interactivity (ignore $verbose==0/$menu==0)
 
-        print "\n";
-        print "Selected blockchain account '$player' is not registered in DoH as a game player.\n";
-        print "\n";
-        print "To be able to continue and play the game, the account must register as a player.\n";
-        print "If you do not want to register now, just press CTRL+C to exit pldoh, kill -9 the\n";
-        print "  process ID, or close the terminal window.\n";
-        print "\n";
-        print "If you want to register your account as a player now, please select below whether\n";
-        print "  you want to opt in or opt out of DoH politics (i.e. the Squad game).\n";
-        print "\n";
-        print "Player registration option:\n";
-        print "[1] Yes, play politics (opt in to politics)\n";
-        print "[2] No politics (opt out of politics)\n";
-        print "\n";
-        print "Enter the desired option: ";
-        my $selection = <STDIN>;
-        chomp($selection);
-        if ($selection =~ /^\d+$/ && $selection >= 1 && $selection <= 2) {
-            my $oopbool;
-            if ($selection == 1) {
-                $oopbool = "false";  # opt in, i.e. DON'T opt out
+        # ... UNLESS $no_politics is defined to either 'false' or 'true', in which case there's no
+        #     question to ask and we will just regplayer.
+
+        my $oopbool;
+        if (defined $no_politics) {
+            $oopbool = $no_politics; # $nopolitics is already validated to be either 'false' or 'true'
+            if ($verbose) {
+                print "Selected blockchain account '$player' is not registered in DoH as a game player.\n";
+                print "Registering account as a player automatically since nopolitics option is set (to '$no_politics')...\n";
+            }
+        } else {
+            print "\n";
+            print "Selected blockchain account '$player' is not registered in DoH as a game player.\n";
+            print "\n";
+            print "To be able to continue and play the game, the account must register as a player.\n";
+            print "If you do not want to register now, just press CTRL+C to exit pldoh, kill -9 the\n";
+            print "  process ID, or close the terminal window.\n";
+            print "\n";
+            print "If you want to register your account as a player now, please select below whether\n";
+            print "  you want to opt in or opt out of DoH politics (i.e. the Squad game).\n";
+            print "\n";
+            print "Player registration option:\n";
+            print "[1] Yes, play politics (opt in to politics)\n";
+            print "[2] No politics (opt out of politics)\n";
+            print "\n";
+            print "Enter the desired option: ";
+            my $selection = <STDIN>;
+            chomp($selection);
+            if ($selection =~ /^\d+$/ && $selection >= 1 && $selection <= 2) {
+                if ($selection == 1) {
+                    $oopbool = "false";  # opt in, i.e. DON'T opt out
+                } else {
+                    $oopbool = "true";   # DON'T opt in, i.e. opt out
+                }
             } else {
-                $oopbool = "true";   # DON'T opt in, i.e. opt out
+                print "ERR-043: Invalid politics menu selection.\n";
+                exit 1;
             }
             print "Selected politics option: $selection ($oopbool)\n";
+        }
 
-            # Attempt to regplayer
+        # Attempt to regplayer
 
-            my $regplayer_cmd = "$cleos -u $api push action hegemon.${hgm} regplayer '{\"player\":\"$player\", \"opt_out_of_politics\":$oopbool}' -p $player $old_rpc_postfix $postfix";
-            print "Command: $regplayer_cmd\n";
-            $o = `$regplayer_cmd`;
-            if ($? != 0) {
-                if (! check_authorization_error($o)) {
-                    print "Result: $o\n";
-                    print "ERR-010: Can't regplayer (unknown reason).\n";
-                }
-                exit 1;
+        my $regplayer_cmd = "$cleos -u $api push action hegemon.${hgm} regplayer '{\"player\":\"$player\", \"opt_out_of_politics\":$oopbool}' -p $player $old_rpc_postfix $postfix";
+        print "Command: $regplayer_cmd\n";
+        $o = `$regplayer_cmd`;
+        if ($? != 0) {
+            if (! check_authorization_error($o)) {
+                print "Result: $o\n";
+                print "ERR-010: Can't regplayer (unknown reason).\n";
             }
+            exit 1;
+        }
 
-            print "Player registration request command submitted. Querying player table to check if it's all right.";
+        print "Player registration request command submitted. Querying player table to check if it's all right.";
 
-            $obj = execute_player_hard_query();
+        $obj = execute_player_hard_query();
 
-            $row_count = scalar @{$obj->{rows}};
+        $row_count = scalar @{$obj->{rows}};
 
-            if ($row_count >= 2) {
-                print "ERR-009: Multiple rows returned by a player table query (zero or one expected).\n";
-                exit 1;
-            } elsif ($row_count == 1) {
-                # regplayer counts as an auth check
-                $need_auth_check = 0;
-                # All good: player's blockchain account has called regplayer.
-                # Found one player object with $player account as its owner.
-                print "One player record found (player seems to be registered).\n";
-            } elsif ($row_count == 0) {
-                print "ERR-011: No player record found; regplayer seems to have failed.\n";
-                exit 1;
-            }
-
-        } else {
-            print "ERR-043: Invalid politics menu selection.\n";
+        if ($row_count >= 2) {
+            print "ERR-009: Multiple rows returned by a player table query (zero or one expected).\n";
+            exit 1;
+        } elsif ($row_count == 1) {
+            # regplayer counts as an auth check
+            $need_auth_check = 0;
+            # All good: player's blockchain account has called regplayer.
+            # Found one player object with $player account as its owner.
+            print "One player record found (player seems to be registered).\n";
+        } elsif ($row_count == 0) {
+            print "ERR-011: No player record found; regplayer seems to have failed.\n";
             exit 1;
         }
 
@@ -2482,35 +2545,12 @@ if (@opt_upgradechar)  { run_batch_command("upgradechar '{\"character_id\":\"$op
 
 # Politics commands
 
-if (@opt_propose) {       # voter(player) group_id leader "rank1 rank2 rank3 ..." [auth:voter]
-    print "ERROR: NOT IMPLEMENTED\n";
-    exit 1;
-}
-
-if (@opt_voteprop) {      # voter(player) proposal_id [auth:voter]
-    print "ERROR: NOT IMPLEMENTED\n";
-    exit 1;
-}
-
-if (@opt_unvoteprop) {    # voter(player) proposal_id [auth:voter]
-    print "ERROR: NOT IMPLEMENTED\n";
-    exit 1;
-}
-
-if (@opt_addcandidacy) {  # character_id [auth:char->owner]
-    print "ERROR: NOT IMPLEMENTED\n";
-    exit 1;
-}
-
-if (@opt_remcandidacy) {  # character_id [auth:char->owner]
-    print "ERROR: NOT IMPLEMENTED\n";
-    exit 1;
-}
-
-if (@opt_setvotes) {      # player "candidate_id1 candidateid_2 candidateid_3 ..." [auth:player]
-    print "ERROR: NOT IMPLEMENTED\n";
-    exit 1;
-}
+if (@opt_propose) { run_batch_command("propose '{\"voter\":\"$opt_propose[0]\", \"group_id\":\"$opt_propose[1]\", \"leader\":\"$opt_propose[2]\", \"ranks\":\"$opt_propose[3]\"}'"); }
+if (@opt_voteprop) { run_batch_command("voteprop '{\"voter\":\"$opt_voteprop[0]\", \"proposal_id\":\"$opt_voteprop[1]\"}'"); }
+if (@opt_unvoteprop) { run_batch_command("unvoteprop '{\"voter\":\"$opt_unvoteprop[0]\", \"proposal_id\":\"$opt_unvoteprop[1]\"}'"); }
+if (@opt_addcandidacy) { run_batch_command("addcandidacy '{\"character_id\":\"$opt_addcandidacy[0]\"}'"); }
+if (@opt_remcandidacy) { run_batch_command("remcandidacy '{\"character_id\":\"$opt_remcandidacy[0]\"}'"); }
+if (@opt_setvotes) { run_batch_command("setvotes '{\"player\":\"$opt_setvotes[0]\", \"candidates\":\"$opt_setvotes[1]\"}'"); }
 
 # --------------------------------------------------------------------------------------------
 # If menu mode, enter menu loop (otherwise exit)
