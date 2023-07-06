@@ -1296,6 +1296,20 @@ sub set_nopolitics {
     if ($verbose) { print "Nopolitics set to '$no_politics'.\n"; }
 }
 
+sub get_array_json_from_list {
+    # given a space or comma separated list of elements in a string,
+    #  return a JSON string for the array notation of it with all elements quoted
+    my $list = shift;
+    if (! defined $list) {
+        print "ERROR: Internal error at get_array_json_from_list()\n";
+        exit 1;
+    }
+    my @elements = split /[,\s]+/, $list;
+    my @elements_quoted = map { qq("$_") } @elements; # add "" around all elements
+    my $elements_json_param = "[" . join(", ", @elements_quoted) . "]"; # add , between elements and enclose with [] for JSON array notation
+    return ($elements_json_param, scalar(@elements));
+}
+
 # --------------------------------------------------------------------------------------------
 # Parse command-line arguments
 # --------------------------------------------------------------------------------------------
@@ -1464,6 +1478,8 @@ if ($opt_help) {
     print "\n";
     print "If no options given, run in interactive (menu/player) mode, and verbose mode.\n";
     print "Command-line overrides config file '$pldoh_config', which overrides defaults.\n";
+    print "Game command arguments that are lists can have the elements separated by either\n";
+    print "  commas (',') or spaces (' '); enclose with \"\" in the shell if necessary.\n";
     print "\n";
     print "Usage:\n";
     print "  pldoh [OPTIONS]\n";
@@ -1547,9 +1563,9 @@ if ($opt_help) {
     print "  --addcandidacy <c>          [c]haracter id\n";
     print "  --propose <v> <g> <l> <r>   [v]oter, [g]roup id, [l]eader, [r]anks\n";
     print "                              v and l are player account names\n";
-    print "                              r is a space-separated list of names (use \"\")\n";
+    print "                              r is a vector of group player names to rank\n";
     print "  --remcandidacy <c>          [c]haracter id\n";
-    print "  --setvotes <p> <c>          [p]layer, [c]andidates (candidate ids list; use \"\")\n";
+    print "  --setvotes <p> <c>          [p]layer, [c]andidates (character ids vector)\n";
     print "  --unvoteprop <v> <p>        [v]oter, [p]roposal id\n";
     print "  --voteprop <v> <p>          [v]oter, [p]roposal id\n";
     print "\n";
@@ -2140,7 +2156,7 @@ if ($menu || $opt_regplayer) {
         if (! $mute) { print "Command: $regplayer_cmd\n"; }
         $o = `$regplayer_cmd`;
         if ($? != 0) {
-            if (! check_authorization_error($o)) { 
+            if (! check_authorization_error($o)) {
                 print "Result: $o\n";
                 print "ERR-010: Can't regplayer (unknown reason).\n";
             }
@@ -2559,13 +2575,22 @@ if (@opt_revivechar)   { run_batch_command("revivechar '{\"character_id\":\"$opt
 if (@opt_upgradechar)  { run_batch_command("upgradechar '{\"character_id\":\"$opt_upgradechar[0]\", \"new_role\":\"$opt_upgradechar[1]\"}'"); }
 
 # Politics commands
-
-if (@opt_propose) { run_batch_command("propose '{\"voter\":\"$opt_propose[0]\", \"group_id\":\"$opt_propose[1]\", \"leader\":\"$opt_propose[2]\", \"ranks\":\"$opt_propose[3]\"}'", get_politics()); }
+if (@opt_propose) {
+    my ($ranks_json_param, $num_ranks) = get_array_json_from_list($opt_propose[3]);
+    if ($num_ranks != 5) { # 5 is the squad (group/playoffs) size for the political playoffs
+        print "ERR-000: Invalid count of ranks given to --propose: $num_ranks; ranks is a space or comma-separated list of player names.\n";
+        exit 1;
+    }
+    run_batch_command("propose '{\"voter\":\"$opt_propose[0]\", \"group_id\":\"$opt_propose[1]\", \"data\":[\"political_playoff_proposal\", {\"leader\":\"$opt_propose[2]\", \"ranks\":$ranks_json_param}]}'", get_politics());
+}
 if (@opt_voteprop) { run_batch_command("voteprop '{\"voter\":\"$opt_voteprop[0]\", \"proposal_id\":\"$opt_voteprop[1]\"}'", get_politics()); }
 if (@opt_unvoteprop) { run_batch_command("unvoteprop '{\"voter\":\"$opt_unvoteprop[0]\", \"proposal_id\":\"$opt_unvoteprop[1]\"}'", get_politics()); }
 if (@opt_addcandidacy) { run_batch_command("addcandidacy '{\"character_id\":\"$opt_addcandidacy[0]\"}'", get_politics()); }
 if (@opt_remcandidacy) { run_batch_command("remcandidacy '{\"character_id\":\"$opt_remcandidacy[0]\"}'", get_politics()); }
-if (@opt_setvotes) { run_batch_command("setvotes '{\"player\":\"$opt_setvotes[0]\", \"candidates\":$opt_setvotes[1]}'", get_politics()); }
+if (@opt_setvotes) { #[$opt_setvotes[1]]  <--this also works, without the quotes per element  [17,3,5] etc.
+    my ($candidates_json_param, $num_candidates) = get_array_json_from_list($opt_setvotes[1]);
+    run_batch_command("setvotes '{\"player\":\"$opt_setvotes[0]\", \"candidates\":$candidates_json_param}'", get_politics());
+}
 
 # --------------------------------------------------------------------------------------------
 # If menu mode, enter menu loop (otherwise exit)
