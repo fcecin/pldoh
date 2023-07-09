@@ -26,16 +26,20 @@
 #
 # TODO:
 #
+# - shaq extra tests (manually)
+#
+# - LATER: support other keytypes other than i64/name (composite key e.g. for secondary index of tile)
+#          --> 128 bit composite key support added, together with name<-->uint64
+#              generic query will not support this; instead, custom query commands will assemble and run these
+#
+# - LATER: getopt::long is not enforcing max number of args in an option
+#
 # - LATER: make --abi output prettier (more compact; with more insight on e.g. action parameters and
 #          struct field formatting, and all other elements)
-#
-# - LATER: add staking to batch play commands
 #
 # - LATER: think about the code duplication between interactive mode and batch mode (e.g. cleos push action doeng x 2)
 #   see if there's common code that can be replaced by subs that are common to both -- or ONE sub that knows how
 #   to carry out any action with named parameters (better)
-#
-# - LATER: support other keytypes other than i64/name (composite key e.g. for secondary index of tile)
 #
 # - LATER: add the ability to use game strings in the command line e.g. mineral, tool, farm, freight truck, etc. that translate
 #   to IDs (get the mapping from the data model)
@@ -45,9 +49,6 @@
 # - LATER: solve character name to character id in command line
 #
 # - LATER: solve "all" in place of quantity for dopickup & dodropoff
-#
-# - LATER: add token-manipulation functions for TCN and etc. balances.
-#          send and receive tokens (transfer, stake, unstake)
 #
 # - LATER: when finishing this, we want to make it so that
 #   - the player/char displays, and menu cards, all display relevant information
@@ -103,6 +104,11 @@ use Term::ReadKey;
 # to install: sudo cpan Curses (?)
 BEGIN { $Curses::OldCurses = 1; }    # FIXME/TODO: can we get rid of this? i.e. convert old curses calls to new curses calls
 use Curses;
+
+# enables big integers across the entire script
+# this allows us to compute and store 128-bit integers for the composite-key idiom
+# "use bigint;" doesn't do what we want. have to use bignum to preserve fractional numbers
+use bignum;
 
 # --------------------------------------------------------------------------------------------
 # Mini JSON parser copied from JSON::Tiny
@@ -411,7 +417,6 @@ sub _throw {
 
 package JSON::Tiny::_Bool;
 use overload '""' => sub { ${$_[0]} }, fallback => 1;
-1;
 }
 
 # --------------------------------------------------------------------------------------------
@@ -447,6 +452,8 @@ my $players_dir = "p";   # default name for the subdirectory that contains accou
                          #   (player-name) subdirectories
 
 my $global_data_dir = "_global"; # p/_global/ gets global data (not a player dir)
+
+my $default_query_limit = 200;   # default value for cleos --limit
 
 my $forever_seconds = 31536000;   # one year -- cache retention for load_dm() game content
 
@@ -529,7 +536,119 @@ my $cleos = "cleos --wallet-url unix://./keosd.sock";
 # Utilities
 # --------------------------------------------------------------------------------------------
 
+sub get_hegemon  { return "hegemon.${hgm}"; }
 sub get_politics { return "politics.${hgm}"; }
+sub get_staking  { return "staking.${tcn}"; }
+sub get_tokens   { return "tokens.${tcn}"; }
+
+sub get_128 { # aka composite_key(hi,lo)
+    my $hi_u64 = shift;
+    if (! defined $hi_u64) { die "ERROR get_128 hi"; }
+    my $lo_u64 = shift;
+    if (! defined $hi_u64) { die "ERROR get_128 lo"; }
+    my $u128 = ($hi_u64 << 64) + $lo_u64;
+    return $u128;
+}
+
+sub get_hi64 {
+    my $hi = shift;
+    if (! defined $hi) { die "ERROR get_hi64"; }
+    return $hi >> 64;
+}
+
+my $__64bitmask__ = (1 << 64) - 1;
+sub get_lo64 {
+    my $lo = shift;
+    if (! defined $lo) { die "ERROR get_lo64"; }
+    return $lo & $__64bitmask__;
+}
+
+sub char_to_symbol { # aux sub
+    my ($c) = @_;
+    if ($c ge 'a' && $c le 'z') {
+        return ord($c) - ord('a') + 6;
+    }
+    elsif ($c ge '1' && $c le '5') {
+        return ord($c) - ord('1') + 1;
+    }
+    else {
+        return 0;
+    }
+}
+
+# parameter is an eosio name string e.g. 'account.name', returns an uint64 value
+sub name_to_u64 {
+    my ($str) = @_;
+    if (!defined $str) { die "ERROR name_to_u64: undef name"; }
+    if (!valid_name($str)) { die "ERROR name_to_u64: invalid name"; }
+    my $n = 0;
+    my $i = 0;
+    while ($i < length($str) && $i < 12) {
+        $n |= (char_to_symbol(substr($str, $i, 1)) & 0x1f) << (64 - 5 * ($i + 1));
+        $i++;
+    }
+    if ($i < length($str) && $i == 12) {
+        $n |= char_to_symbol(substr($str, $i, 1)) & 0x0f;
+    }
+    return $n;
+}
+
+sub symbol_to_char { # aux sub
+    my ($symbol) = @_;
+    if ($symbol >= 6 && $symbol <= 31) {
+        return chr($symbol + ord('a') - 6);
+    }
+    elsif ($symbol >= 1 && $symbol <= 5) {
+        return chr($symbol + ord('1') - 1);
+    }
+    else {
+        return '';
+    }
+}
+
+# parameter is an uint64 value, returns an eosio name string e.g. 'eoseoseoseos'
+sub u64_to_name {
+    my ($n) = @_;
+    if (!defined $n) { die "ERROR u64_to_name: undef num"; }
+    my $str = '';
+    for (my $i = 0; $i < 12; $i++) {
+        my $shift = 64 - 5 * ($i + 1);
+        my $symbol = ($n >> $shift) & 0x1f;
+        my $char = symbol_to_char($symbol);
+        last unless $char;
+        $str .= $char;
+    }
+    return $str;
+}
+
+# given a string like 'TCN' or 'AAAAAAA', return the symbol.code().raw() value (uint64_t)
+sub get_symbol_code {
+    my ($str) = @_;
+    if (!defined $str) { die "ERROR get_symbol_code: no symbol str"; }
+    if (length($str) < 1 || length($str) > 7) { die "ERROR get_symbol_code: symbol str must have between 1 and 7 characters"; }
+    my $len = length($str);
+    my $result = 0;
+    for (my $i = 0; $i < $len; ++$i) {
+        die "ERROR: Invalid character in symbol name" unless ($str =~ /^[A-Z]+$/);
+        $result |= (ord(substr($str, $i, 1)) << (8*$i));
+    }
+    return $result;
+}
+
+# given the symbol.code().raw() value, returns the string symbol name like 'TCN' or 'FOOBAR'
+sub get_symbol_name {
+   my ($number) = @_;
+   if (!defined $number) { die "ERROR get_symbol_name: no symbol number"; }
+   if ($number < 0 || $number > 72057594037927935) { die "ERROR get_symbol_name: symbol number out of range"; }
+   my $result = '';
+   for (my $i = 0; $i < 7; ++$i) {
+      my $char_code = ($number >> (8*$i)) & 0xFF;
+      last if ($char_code == 0);
+      die "ERROR: Invalid character in symbol name" unless ($char_code >= 65 && $char_code <= 90);
+      $result .= chr($char_code);
+   }
+   return $result;
+}
 
 # Check valid Antelope account name
 sub valid_name {
@@ -898,7 +1017,7 @@ sub run_batch_query {
     my $hi = shift;
     if (! defined $hi) { $hi = $lo; }
     my $lim = shift;
-    if (! defined $lim) { $lim = 100; }
+    if (! defined $lim) { $lim = $default_query_limit; }
     if (!looks_like_number($lim)) {
         print "ERROR: run_batch_query(): non-numeric query limit parameter provided: '$lim'\n";
         exit 1;
@@ -1189,7 +1308,7 @@ sub load_dm {
     $dm{$contract_table} //= {};  # create dm->$contract_table hash if needed
     my $lo = 0;
     while (1) {
-        my $obj = $o = get_table($contract_table, "-L$lo --limit 100", $forever_seconds);
+        my $obj = $o = get_table($contract_table, "-L$lo --limit $default_query_limit", $forever_seconds);
         if (! defined $obj) {
             print "ERR-000: load_dm(): cannot load $contract_table $lo\n";
             exit 1;
@@ -1214,7 +1333,7 @@ sub load_dm {
             print "ERR-000: load_dm(): malformed $contract_table query answer (rows) $lo\n";
             exit 1;
         }
-        if ($verbose) { print "."; } # neato progress bar, 1 dot is --limit (100?)
+        if ($verbose) { print "."; } # neato progress bar, 1 dot is --limit
         # check more and next key
         if (exists $obj->{more}) {
             if ($obj->{more} != '0') {
@@ -1253,9 +1372,12 @@ sub load_all_game_data {
     if ($verbose) { print "Loading core game data (cache or API node). This might take a while.\n"; }
 
     # all tables to fully load, in get_table() first argument format: contractname-tablename
+    # tables to load elements are a pair; the second element is the primary key's name, which is
+    #   used as the Perl hash key in %dm for storing and accessing the elements of this contract+table.
     my @tables_to_load =
         (
-         "hegemon.${hgm}-tiles"
+         ["hegemon.${hgm}-tiles",   $id_key],
+         [get_staking()."-targets", "target"],
          # TODO: tile types
          # TODO: blueprints
          # TODO: recipes
@@ -1263,9 +1385,10 @@ sub load_all_game_data {
         );
 
     # load all tables
-    foreach my $contract_table (@tables_to_load) {
-        if ($verbose) { print "Loading table $contract_table: "; }
-        load_dm($contract_table, $id_key);
+    foreach my $pair (@tables_to_load) {
+        my ($contract_table, $key_name) = @$pair;
+        if ($verbose) { print "Loading table $contract_table (key name: $key_name): "; }
+        load_dm($contract_table, $key_name);
         if ($verbose) { print "\n  Loaded " . scalar(%{$dm{$contract_table}}) . " objects.\n"; }
     }
 
@@ -1276,7 +1399,8 @@ sub load_all_game_data {
          get_politics(),
          "crafting.${hgm}",
          "names.${hgm}",
-         "staking.${tcn}"
+         get_staking(),
+         get_tokens()
         );
 
     # load all ABIs
@@ -1310,6 +1434,23 @@ sub get_array_json_from_list {
     return ($elements_json_param, scalar(@elements));
 }
 
+sub get_stake_row { # fetches an exact staking row
+    my $target = shift;
+    if (! defined $target) { die "ERROR get_stake_row invalid target\n"; }
+    my $player_value = name_to_u64($player);
+    my $target_value = name_to_u64($target);
+    my $unique = get_128($player_value, $target_value);
+    my $obj = get_table(get_staking()."-stakes", "--key-type i128 --index 2 -L$unique -U$unique", 0);
+    # FIXME/TODO: need a thing that navigates the struct searching for fields with values.
+    #             then if it finds it, returns it, otherwise returns undef, so we don't
+    #             have to be doing manual checks.
+    my $result_stake_id;
+    if (exists $obj->{'rows'} && scalar @{$obj->{rows}} > 0 && exists $obj->{'rows'}->[0]->{'id'}) {
+        $result_stake_id = $obj->{'rows'}[0]->{'id'};
+    }
+    return $result_stake_id; # undef if not found
+}
+
 # --------------------------------------------------------------------------------------------
 # Parse command-line arguments
 # --------------------------------------------------------------------------------------------
@@ -1335,9 +1476,10 @@ my @opt_cleostx;
 # Queries
 my @opt_abi;
 my @opt_contract;
+my @opt_players; # since --query does everything (or /should/ be able to do everything, as far as we know), it's questionable whether we need specialized query commands like --players [pagenum]; --players might be removed in the future.
 my @opt_query;
 my @opt_squery;
-my @opt_players; # since --query does everything (or /should/ be able to do everything, as far as we know), it's questionable whether we need specialized query commands like --players [pagenum]; --players might be removed in the future.
+my $opt_wallet;
 
 # Player cmds
 my $opt_createchar;
@@ -1392,6 +1534,19 @@ my @opt_setvotes;
 #stakechange -- admin/etc.
 #factioncheck -- admin/etc.
 
+# Staking cmds:  (prefixed with st_ to avoid name clashes with recurrent action names
+#addtarget(const name target, const name category) -- admin / _self
+#deltarget(const name target); -- admin / _self
+my @opt_st_close;       # -- name player, symbol symbol
+my @opt_st_detokenize;  # -- name player, asset quantity
+my @opt_st_open;        # -- name player, symbol symbol, name ram_payer
+my @opt_st_stake;       # -- name player name target
+my @opt_st_unstake;     # -- uint64_t id
+my @opt_st_withdraw;    # -- uint64_t id
+
+# Token cmds: (tokens.tc?) contract for TCN & other tokenizable gameplay tokens
+my @opt_tk_stake;       # quantity target expiry
+my @opt_tk_transfer;    # to quantity memo
 
 # Define command-line options
 GetOptions(
@@ -1413,9 +1568,10 @@ GetOptions(
     # Table/ABI queries
     'abi=s{1,2}'        => \@opt_abi,           # fullcontractname|'all', abi-item/key-name
     'contract=s{1}'     => \@opt_contract,      # full contract name (with prefix and suffix, e.g. "hegemon.hgm")
+    'players:s'         => \@opt_players,       # [player table page number (first=0)]
     'q|query=s{1,5}'    => \@opt_query,         # [index=1] table [lower] [upper] [limit]
     's|squery=s{2,6}'   => \@opt_squery,        # [index=1] table scope [lower] [upper] [limit]
-    'players:s'         => \@opt_players,       # [player table page number (first=0)]
+    'w|wallet'          => \$opt_wallet,
 
     # Player commands (player argument is implicitly selected by pldoh, in both interactive and batch mode)
     'createchar'        => \$opt_createchar,    # <void>
@@ -1458,7 +1614,17 @@ GetOptions(
     'unvoteprop=s{2}'   => \@opt_unvoteprop,    # voter(player) proposal_id [auth:voter]
     'addcandidacy=s{1}' => \@opt_addcandidacy,  # character_id [auth:char->owner]
     'remcandidacy=s{1}' => \@opt_remcandidacy,  # character_id [auth:char->owner]
-    'setvotes=s{2}'     => \@opt_setvotes       # player "candidate_id1 candidateid_2 candidateid_3 ..." [auth:player]
+    'setvotes=s{2}'     => \@opt_setvotes,      # player "candidate_id1 candidateid_2 candidateid_3 ..." [auth:player]
+
+    'st_close=s{1}'           => \@opt_st_close,       # token-symbol (MINERAL TOOL FOOD CRYOPOD CLONE)
+    'st_detokenize=s{1}'      => \@opt_st_detokenize,  # quantity     (of MINERAL TOOL FOOD CRYOPOD CLONE)
+    'st_open=s{1}'            => \@opt_st_open,        # token-symbol (MINERAL TOOL FOOD CRYOPOD CLONE)
+    'st_stake|stake=s{1}'     => \@opt_st_stake,       # target       (f|r|p + governance|economy)
+    'st_unstake|unstake=s{1}' => \@opt_st_unstake,     # id|target (if target, will be used to locate first id that matches)
+    'st_withdraw=s{1}'        => \@opt_st_withdraw,    # id|target (if target, will be used to locate first id that matches)
+
+    'tk_stake=s{3}'     => \@opt_tk_stake,      # quantity target expiry -- quantity must be "x.xxxx TCN" (ie. TCN only)
+    'tk_transfer=s{3}'  => \@opt_tk_transfer    # to quantity memo
 
 ) or die "ERR-999: Error in command line arguments\n";
 
@@ -1468,6 +1634,8 @@ GetOptions(
 #   =s{2} and :s work differently, so fix the :s case to make it consistent with e.g. =s{2}.
 
 if (scalar(@opt_players) == 0) { undef @opt_players; }
+if (scalar(@opt_st_close) == 0) { undef @opt_st_close; }
+if (scalar(@opt_st_open) == 0) { undef @opt_st_open; }
 
 # Here, print help and exit, or print the startup banner, before we start printing
 #   the results of command-line processing.
@@ -1512,6 +1680,7 @@ if ($opt_help) {
     print "                       short summary of contract(s); if s is '.', match everything\n";
     print "  --contract <c>       Contract for table queries (with suffix e.g. \"hegemon.hgm\");\n";
     print "                       if not specified, pldoh will attempt to guess it\n";
+    print "  --players <n>        Get page <n> of players (n >= 0); $default_query_limit per page\n";
     print "  --query, -q [i] <t> [L] [U] [n]  Run a Smart Query (queries any game table)\n";
     print "      [i]    If first argument is numeric: table index to use (default is 1)\n";
     print "      <t>    Smart Query table name (e.g. \"players\"; contract/scope is guessed)\n";
@@ -1520,9 +1689,9 @@ if ($opt_help) {
     print "              primary index, and iterate to return up to [limit] records)\n";
     print "      [U]    Upper bound key value to return; if '.', no upper bound; if ommitted,\n";
     print "             then the upper bound will be the same as lower bound (exact match)\n";
-    print "      [n]    Max number of records to return, default=100 (cleos '--limit' option)\n";
+    print "      [n]    Max number of records to return, default=$default_query_limit (cleos '--limit' option)\n";
     print "  --squery, -s [i] <t> <s> [L] [U] [n]   Run Smart Query using contract scope s\n";
-    print "  --players <n>         Get page <n> of players (n >= 0); 100 per page\n";
+    print "  --wallet, -w         Print a tokens and staking report for the player\n";
     print "\n";
     print "Player commands:\n";
     print "  --createchar                Attempt to spawn a new character (costs 1 CRYOPOD)\n";
@@ -1569,6 +1738,27 @@ if ($opt_help) {
     print "  --unvoteprop <v> <p>        [v]oter, [p]roposal id\n";
     print "  --voteprop <v> <p>          [v]oter, [p]roposal id\n";
     print "\n";
+    print "Staking commands:  (to get all available staking targets, run 'pldoh -q targets')\n";
+    print "   --st_close <s>             Close balance for game resource token s (e.g.: 'TOOL')\n";
+    print "   --st_detokenize <q>        Transfer a game resource token quantity q from staking\n";
+    print "                              contract to the hegemon contract and --detokenize it\n";
+    print "   --st_open <s>              Open balance for game resource token s (e.g.: 'FOOD')\n";
+    print "   --st_stake <t>             Open staking position for target t; after this, you can\n";
+    print "                              stake a quantity of TCN using the --tk_stake option\n";
+    print "   --st_unstake <p>           Unstake all TCN staked to expired in position p; p is\n";
+    print "                              either the staking position id or the staking target;\n";
+    print "                              if target name, will translate to the first matching id\n";
+    print "   --st_withdraw <p>          Transfers TCN from staking position p in the staking\n";
+    print "                              contract to the player's account; p is id or target;\n";
+    print "                              if target name, will translate to the first matching id\n";
+    print "\n";
+    print "Token commands:\n";
+    print "   --tk_stake <q> <t> <e>     Transfer quantity q (TCN only) from player's account to\n";
+    print "                              the staking contract and stakes it to target t and the\n";
+    print "                              expiry period e in days; must use --st_stake first\n";
+    print "   --tk_transfer <t> <q> <m>  Transfer quantity q of tokens from the player's account\n";
+    print "                              to blockchain account or player name t with memo m\n";
+    print "\n";
     exit 1;
 }
 
@@ -1576,7 +1766,7 @@ if ($opt_help) {
 # If any option that sends transactions is called, we set txsign to 1
 
 if ($opt_batch || @opt_map || @opt_route
-    || @opt_abi || @opt_query || @opt_squery || @opt_players
+    || @opt_abi || @opt_players || @opt_query || @opt_squery || $opt_wallet
     )
 {
     $menu = 0;
@@ -1586,7 +1776,8 @@ if (@opt_cleos || @opt_cleostx    # will potentially need it, so just require it
     || $opt_createchar || @opt_detokenize || @opt_dodropoff || @opt_doload || @opt_domove || @opt_dopickup || @opt_dounload || @opt_joinfaction || @opt_tokenize
     || @opt_doaddmats || @opt_doaddproj || @opt_dobuild || @opt_docancelproj || @opt_docivil || @opt_docommerce || @opt_docraft || @opt_dodisembark || @opt_doeat || @opt_doembark || @opt_doeng || @opt_doequip || @opt_dofarming || @opt_dohealth || @opt_dointel || @opt_dologis || @opt_domilitary || @opt_domining || @opt_doresearch || @opt_dounequip || @opt_revivechar || @opt_upgradechar
     || @opt_propose || @opt_voteprop || @opt_unvoteprop || @opt_addcandidacy || @opt_remcandidacy || @opt_setvotes
-
+    || @opt_st_close || @opt_st_detokenize || @opt_st_open || @opt_st_stake || @opt_st_unstake || @opt_st_withdraw
+    || @opt_tk_stake || @opt_tk_transfer
    )
 {
     $menu = 0;
@@ -1846,7 +2037,11 @@ while (my $line = <$fh>) {
     }
 
     if ($key eq $tcn_key) {
-        set_hgm_tcn($value);
+        if (@opt_tcn) {
+            if ($verbose) { print "    hgm/tcn suffix config already set via --tcn; ignoring.\n"; }
+        } else {
+            set_hgm_tcn($value);
+        }
     }
 
     if ($key eq $nopolitics_key) {
@@ -2502,16 +2697,159 @@ if (@opt_query) {
 
 if (@opt_players) {
     my $page_num = looks_like_number($opt_players[0]) ? $opt_players[0] : 0;
-    my $lo = $page_num * 100;
-    my $hi = $lo + 99;
+    my $lo = $page_num * $default_query_limit;
+    my $hi = $lo + $default_query_limit - 1;
 
     if (! $mute) { print "Querying player page $page_num [$lo, $hi].\n"; }
-    $o = get_table("hegemon.${hgm}-players", "-L$lo -U$hi --limit 100", 0);
+    $o = get_table("hegemon.${hgm}-players", "-L$lo -U$hi --limit $default_query_limit", 0);
     if ($o) {
         print dump_hash($o, 0);
     } else {
         print "ERROR: Failed to query players table.\n";
         exit 1;
+    }
+}
+
+if ($opt_wallet) {
+
+    # ----------------------------------------------------------------------------------------
+    #   REVIEW/TODO: Is there an in-game version of a TCN balance? I.e. detokenized TCN?
+    # ----------------------------------------------------------------------------------------
+
+    # First half of report are for the 5 basic assets (plus liquid TCN in the player's account)
+
+    print "Game asset report for player $player:\n\n";
+    print "                      MINERAL         TOOL         FOOD      CRYOPOD        CLONE             TCN\n";
+
+    my $game_acc = sprintf("%12s", get_hegemon());
+    my $stak_acc = sprintf("%12s", get_staking());
+    my $plyr_acc = sprintf("%12s", $player);
+
+    my ($mi, $to, $fo, $cr, $cl) = (0) x 5;
+
+    # Get the 5 basic assets in the game (detokenized, i.e. in game state)
+
+    my $obj = execute_player_hard_query();
+
+    if (!(exists $obj->{'rows'} && scalar @{$obj->{rows}} > 0 && exists $obj->{'rows'}->[0]->{'inventory'})) {
+        print "ERR-000: Got malformed player query for $player\n";
+        exit 1;
+    }
+
+    my $inventory_array = $obj->{'rows'}->[0]->{'inventory'};
+    foreach my $item (@$inventory_array) {
+        my $qty  = $item->{'first'};
+        my $type = $item->{'second'};
+        if ($type == 1) { $mi = $qty; }
+        elsif ($type == 2) { $to = $qty; }
+        elsif ($type == 3) { $fo = $qty; }
+        elsif ($type == 4) { $cr = $qty; }
+        elsif ($type == 5) { $cl = $qty; }
+    }
+
+    $mi = sprintf("%12.4f", $mi/10000);
+    $to = sprintf("%12.4f", $to/10000);
+    $fo = sprintf("%12.4f", $fo/10000);
+    $cr = sprintf("%12.4f", $cr/10000);
+    $cl = sprintf("%12.4f", $cl/10000);
+
+    print "In $game_acc: $mi $to $fo $cr $cl\n";
+
+    # Get the 5 basic assets as tokens in the staking contract balance
+
+    ($mi, $to, $fo, $cr, $cl) = (0) x 5;
+
+    $obj = get_table(get_staking()."-accounts-".$player, "", 0);
+
+    if (!(exists $obj->{'rows'})) {
+        print "ERR-000: Got malformed staking balance query for $player\n";
+        exit 1;
+    }
+
+    foreach my $row (@{$obj->{rows}}) {
+        my ($amount, $token) = split(' ', $row->{'balance'}, 2);
+        if ($token    eq 'MINERAL') { $mi = $amount; }
+        elsif ($token eq 'TOOL')    { $to = $amount; }
+        elsif ($token eq 'FOOD')    { $fo = $amount; }
+        elsif ($token eq 'CRYOPOD') { $cr = $amount; }
+        elsif ($token eq 'CLONE')   { $cl = $amount; }
+    }
+
+    $mi = sprintf("%12s", $mi);
+    $to = sprintf("%12s", $to);
+    $fo = sprintf("%12s", $fo);
+    $cr = sprintf("%12s", $cr);
+    $cl = sprintf("%12s", $cl);
+
+    print "In $stak_acc: $mi $to $fo $cr $cl\n";
+
+    # Get the 5 basic assets as tokens in the player's account
+
+    ($mi, $to, $fo, $cr, $cl) = (0) x 5;
+    my $tcnbal = 0;
+
+    $obj = get_table(get_tokens()."-accounts-".$player, "", 0);
+
+    if (!(exists $obj->{'rows'})) {
+        print "ERR-000: Got malformed tokens balance query for $player\n";
+        exit 1;
+    }
+
+    foreach my $row (@{$obj->{rows}}) {
+        my ($amount, $token) = split(' ', $row->{'balance'}, 2);
+        if ($token    eq 'MINERAL') { $mi = $amount; }
+        elsif ($token eq 'TOOL')    { $to = $amount; }
+        elsif ($token eq 'FOOD')    { $fo = $amount; }
+        elsif ($token eq 'CRYOPOD') { $cr = $amount; }
+        elsif ($token eq 'CLONE')   { $cl = $amount; }
+        elsif ($token eq 'TCN')     { $tcnbal = $amount; }
+    }
+
+    $mi = sprintf("%12s", $mi);
+    $to = sprintf("%12s", $to);
+    $fo = sprintf("%12s", $fo);
+    $cr = sprintf("%12s", $cr);
+    $cl = sprintf("%12s", $cl);
+    $tcnbal = sprintf("%15s", $tcnbal);
+
+    print "In $plyr_acc: $mi $to $fo $cr $cl $tcnbal\n";
+
+    # Second part of the report are the staking rows for the player
+
+    # FIXME/TODO
+    #   for ALL staking entries for that player (one per target+faction?)
+    #   - TCN balance in the staking entry (+ other details, like expiry, staking power)
+    #
+
+    print "\nStaking positions report for player $player:\n\n";
+    print "          id       target     quantity       expiry                unstaking_since\n";
+
+    # FIXME/TODO: Making one query with a high --limit is easier than dealing with pages of results.
+    # Let's just assume for now that the player's staking positions fit within the default query limit.
+
+    my $player_value = name_to_u64($player);
+    my $target_value_min   = 0;
+    my $target_value_max   = 18446744073709551615;
+    my $unique_lo = get_128($player_value, $target_value_min);
+    my $unique_hi = get_128($player_value, $target_value_max);
+    $obj = get_table(get_staking()."-stakes", "--key-type i128 --index 2 -L$unique_lo -U$unique_hi --limit $default_query_limit", 0);
+    # FIXME/TODO: need a thing that navigates the struct searching for fields with values.
+    #             then if it finds it, returns it, otherwise returns undef, so we don't
+    #             have to be doing manual checks.
+    my $result_stake_id;
+    if (exists $obj->{'rows'}) {
+        foreach my $row (@{$obj->{rows}}) {
+            if (exists $row->{'id'}) {
+                my $id              = sprintf("%12s", $row->{'id'});
+                my $target          = sprintf("%12s", $row->{'target'});
+                my $quantity        = sprintf("%12s", $row->{'quantity'});
+                my $expiry          = sprintf("%12s", $row->{'expiry'});
+                my $unstaking_since = sprintf("%30s", $row->{'unstaking_since'});
+                print "$id $target $quantity $expiry $unstaking_since\n";
+            } else {
+                print "ERR-000: Got malformed staking entry for $player\n";
+            }
+        }
     }
 }
 
@@ -2591,6 +2929,40 @@ if (@opt_setvotes) { #[$opt_setvotes[1]]  <--this also works, without the quotes
     my ($candidates_json_param, $num_candidates) = get_array_json_from_list($opt_setvotes[1]);
     run_batch_command("setvotes '{\"player\":\"$opt_setvotes[0]\", \"candidates\":$candidates_json_param}'", get_politics());
 }
+
+# Staking commands
+if (@opt_st_open) { run_batch_command("open '{\"player\":\"$player\", \"symbol\":\"4,$opt_st_open[0]\", \"ram_payer\":\"$player\"}'", get_staking()); }
+if (@opt_st_close) { run_batch_command("close '{\"player\":\"$player\", \"symbol\":\"4,$opt_st_close[0]\"}'", get_staking()); }
+if (@opt_st_detokenize) { run_batch_command("detokenize '{\"player\":\"$player\", \"asset\":\"$opt_st_detokenize[0]\"}'", get_staking()); }
+if (@opt_st_stake) { run_batch_command("stake '{\"player\":\"$player\", \"target\":\"$opt_st_stake[0]\"}'", get_staking()); }
+if (@opt_st_unstake) {
+    my $stake_id = $opt_st_unstake[0];
+    if (! looks_like_number($stake_id)) {
+        my $target = $stake_id; # must take the current player and the given target, and try to find a stake ID for it
+        $stake_id = get_stake_row($target); # $player is implicit (global)
+        if (! defined $stake_id) {
+            print "ERR-000: --st_unstake: cannot locate stake id for player '$player' and staking target '$target'\n";
+            exit 1;
+        }
+    }
+    run_batch_command("unstake '{\"player\":\"$player\", \"id\":\"$stake_id\"}'", get_staking());
+}
+if (@opt_st_withdraw) {
+    my $stake_id = $opt_st_withdraw[0];
+    if (! looks_like_number($stake_id)) {
+        my $target = $stake_id; # must take the current player and the given target, and try to find a stake ID for it
+        $stake_id = get_stake_row($target); # $player is implicit (global)
+        if (! defined $stake_id) {
+            print "ERR-000: --st_withdraw: cannot locate stake id for player '$player' and staking target '$target'\n";
+            exit 1;
+        }
+    }
+    run_batch_command("withdraw '{\"player\":\"$player\", \"id\":\"$stake_id\"}'", get_staking());
+}
+
+# Token commands
+if (@opt_tk_stake) { run_batch_command("transfer '{\"from\":\"$player\", \"to\":\"" . get_staking() . "\", \"quantity\":\"$opt_tk_stake[0]\", \"memo\":\"$opt_tk_stake[1]:$opt_tk_stake[2]\"}'", get_token()); }
+if (@opt_tk_transfer) { run_batch_command("transfer '{\"from\":\"$player\", \"to\":\"$opt_tk_transfer[0]\", \"quantity\":\"$opt_tk_transfer[1]\", \"memo\":\"$opt_tk_transfer[2]\"}'", get_token()); }
 
 # --------------------------------------------------------------------------------------------
 # If menu mode, enter menu loop (otherwise exit)
@@ -3204,9 +3576,9 @@ while (!$quit) {
             wrefresh($win2);
 
             # Queries for all characters of a player in one shot
-            # This is used to assemble an obj_char_list within which we know ALL(<=100) characters are in (--limit 100), so that
+            # This is used to assemble an obj_char_list within which we know ALL(<=$default_query_limit) characters are in (--limit $default_query_limit), so that
             #   individual character queries can be used to update the respective individual element of obj_char_list.
-            my $query_character_list = get_table("hegemon.${hgm}-characters", "--key-type i64 --index 2 -L$player -U$player --limit 100", 0);
+            my $query_character_list = get_table("hegemon.${hgm}-characters", "--key-type i64 --index 2 -L$player -U$player --limit $default_query_limit", 0);
             $obj_char_list = $query_character_list->{'rows'};
 
             # If need to debug and dump the list object  (TODO: remove)
