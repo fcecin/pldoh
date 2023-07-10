@@ -28,14 +28,10 @@
 #
 # - shaq extra tests (manually)
 #
-# - LATER: support other keytypes other than i64/name (composite key e.g. for secondary index of tile)
-#          --> 128 bit composite key support added, together with name<-->uint64
-#              generic query will not support this; instead, custom query commands will assemble and run these
-#
 # - LATER: getopt::long is not enforcing max number of args in an option
 #
 # - LATER: make --abi output prettier (more compact; with more insight on e.g. action parameters and
-#          struct field formatting, and all other elements)
+#          struct field formatting, and all other elements) -- dump_hash post-processor (collapser)
 #
 # - LATER: think about the code duplication between interactive mode and batch mode (e.g. cleos push action doeng x 2)
 #   see if there's common code that can be replaced by subs that are common to both -- or ONE sub that knows how
@@ -1634,8 +1630,6 @@ GetOptions(
 #   =s{2} and :s work differently, so fix the :s case to make it consistent with e.g. =s{2}.
 
 if (scalar(@opt_players) == 0) { undef @opt_players; }
-if (scalar(@opt_st_close) == 0) { undef @opt_st_close; }
-if (scalar(@opt_st_open) == 0) { undef @opt_st_open; }
 
 # Here, print help and exit, or print the startup banner, before we start printing
 #   the results of command-line processing.
@@ -1832,7 +1826,7 @@ if (@opt_tcn) { set_hgm_tcn($opt_tcn[0]); }
 if (@opt_player) { set_player($opt_player[0]); }
 
 # Deal with --purge-cache now, since it affects reading objects and such
-if ($opt_purge_cache) { purge_cache(); }
+if ($opt_purge_cache) { purge_cache(); if (! $mute) { print "Cache purged.\n"; } }
 
 # Deal with --nopolitics
 if (@opt_nopolitics) { set_nopolitics($opt_nopolitics[0]); }

@@ -1,0 +1,9 @@
+# Ignore everything in the current directory and its subdirectories
+**
+
+# Except for the following files
+!.gitignore
+!LICENSE
+!README.md
+!pldoh
+!extras/
