@@ -40,6 +40,11 @@
 #    the faction id is 4 (dominion, do), and the random seed is 0 (so *hopefully* the test is reproducible
 #    with respect to the random roles etc. chosen by players).
 #
+# To see the results of the test:
+#    pldoh -q voters
+#    pldoh -q factions         (look at officers = [ ... ])
+#    pldoh -s candidates 4     (change '4' to the <faction-id> you're running the test on)
+#
 # --------------------------------------------------------------------------
 # test plan
 # 1. create accounts -- ignore duplicate account creation; checks masteracc authorization
