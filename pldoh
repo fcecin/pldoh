@@ -26,7 +26,8 @@
 #
 # TODO:
 #
-# - shaq extra tests (manually)
+# - dodevelop
+# - docontrol
 #
 # - LATER: getopt::long is not enforcing max number of args in an option
 #
@@ -520,6 +521,8 @@ push @PATH, $RealBin;
 
 # cleos prefix with wallet URL
 
+# Nope II: if we change the working dir, then the relative one will work
+# Nope. You need this if you're going to do e.g. "../pldoh" to call the script from extras/
 #my $cleos = "cleos --wallet-url unix://$RealBin/keosd.sock";
 #
 # Should work pointing to the current directory, so if you copy the directory
@@ -1448,7 +1451,47 @@ sub get_stake_row { # fetches an exact staking row
 }
 
 # --------------------------------------------------------------------------------------------
-# Parse command-line arguments
+# Parse command-line arguments (special arguments --cleos and --cleostx)
+# --------------------------------------------------------------------------------------------
+
+# --cleos or --cleostx will gobble up everything after them to avoid having to quote the
+# argument like --cleos "everything you want to pass it". To do that, we preprocess @ARGV
+# to strip a --cleos or --cleostx (only one will work) from it, and then we proceed to
+# the regular GetOptions() below.
+# TODO: --verbose -v -m --mute not processed yet; so just don't print anything (it's just for debug anyway)
+
+my $opt_cleos;
+for (my $i = 0; $i < scalar @ARGV; $i++) {
+    if ($ARGV[$i] eq '--cleos') {
+        splice @ARGV, $i, 1;
+        $opt_cleos = join(' ', map { /\s/ ? "\"$_\"" : $_ } @ARGV[$i .. $#ARGV]);
+        splice @ARGV, $i;
+        #if ($verbose) { print "Found --cleos command with arg: $opt_cleos\n"; }
+        last;
+    }
+}
+
+my $opt_cleostx;
+for (my $i = 0; $i < scalar @ARGV; $i++) {
+    if ($ARGV[$i] eq '--cleostx') {
+        splice @ARGV, $i, 1;
+        $opt_cleostx = join(' ', map { /\s/ ? "\"$_\"" : $_ } @ARGV[$i .. $#ARGV]);
+        splice @ARGV, $i;
+        #if ($verbose) { print "Found --cleostx command with arg: $opt_cleostx\n"; }
+        last;
+    }
+}
+
+if (defined $opt_cleos || defined $opt_cleostx) {
+    if ($verbose) {
+        #print "Remaining arguments: ";
+        #foreach my $arg (@ARGV) { print "$arg "; }
+        #print "\n";
+    }
+}
+
+# --------------------------------------------------------------------------------------------
+# Parse command-line arguments (all regular arguments)
 # --------------------------------------------------------------------------------------------
 
 # Command-line argument parsing does not trigger any work. It just changes configuration
@@ -1466,8 +1509,6 @@ my $opt_regplayer;
 my @opt_route;
 my $opt_verbose;
 my @opt_tcn;
-my @opt_cleos;
-my @opt_cleostx;
 
 # Queries
 my @opt_abi;
@@ -1558,8 +1599,6 @@ GetOptions(
     'route=s{1}'        => \@opt_route,         # destination-tile-id
     'verbose|v'         => \$opt_verbose,
     'tcn=s{1}'          => \@opt_tcn,           # [0,1,2]
-    'cleostx=s{1}'      => \@opt_cleostx,       # "full cleos params string"
-    'cleos=s{1}'        => \@opt_cleos,         # "full cleos params string"
 
     # Table/ABI queries
     'abi=s{1,2}'        => \@opt_abi,           # fullcontractname|'all', abi-item/key-name
@@ -1662,10 +1701,12 @@ if ($opt_help) {
     print "  --verbose, -v        Force verbose mode (for when it is disabled by batch mode)\n";
     print "\n";
     print "General options for development/debugging (temporary -- do not rely on these):\n";
-    print "  --cleos <cmd>        Pass non-transaction <cmd> string to cleos (NOTE: do not\n";
-    print "                       add --wallet-url, -u options; pldoh already adds them)\n";
-    print "  --cleostx <cmd>      Pass send-transaction <cmd> string to cleos (NOTE: do not\n";
-    print "                       add --wallet-url, -u, -p, -t & --use-old-send-rpc options)\n";
+    print "  --cleos <...>        Pass non-transaction <...> arglist to cleos (NOTE: do not\n";
+    print "                       add --wallet-url, -u options; pldoh already adds them);\n";
+    print "                       --cleos gobbles up all remaining arguments, no need to \"\"\n";
+    print "  --cleostx <...>      Pass send-transaction <...> arglist to cleos (NOTE: do not\n";
+    print "                       add --wallet-url, -u, -p, -t & --use-old-send-rpc options);\n";
+    print "                       --cleostx gobbles up all remaining arguments, no need to \"\"\n";
     print "  --tcn <v>            v=0: hgm/tcn; v=1: hg1/tc1; v=2: hg2/tc2\n";
     print "\n";
     print "Queries:\n";
@@ -1766,7 +1807,7 @@ if ($opt_batch || @opt_map || @opt_route
     $menu = 0;
 }
 
-if (@opt_cleos || @opt_cleostx    # will potentially need it, so just require it, to simplify (dev options anyway)
+if ($opt_cleos || $opt_cleostx    # will potentially need it, so just require it, to simplify (dev options anyway)
     || $opt_createchar || @opt_detokenize || @opt_dodropoff || @opt_doload || @opt_domove || @opt_dopickup || @opt_dounload || @opt_joinfaction || @opt_tokenize
     || @opt_doaddmats || @opt_doaddproj || @opt_dobuild || @opt_docancelproj || @opt_docivil || @opt_docommerce || @opt_docraft || @opt_dodisembark || @opt_doeat || @opt_doembark || @opt_doeng || @opt_doequip || @opt_dofarming || @opt_dohealth || @opt_dointel || @opt_dologis || @opt_domilitary || @opt_domining || @opt_doresearch || @opt_dounequip || @opt_revivechar || @opt_upgradechar
     || @opt_propose || @opt_voteprop || @opt_unvoteprop || @opt_addcandidacy || @opt_remcandidacy || @opt_setvotes
@@ -1830,6 +1871,14 @@ if ($opt_purge_cache) { purge_cache(); if (! $mute) { print "Cache purged.\n"; }
 
 # Deal with --nopolitics
 if (@opt_nopolitics) { set_nopolitics($opt_nopolitics[0]); }
+
+# We have to change the working directory to where the pldoh script is, otherwise nothing will work
+if (chdir($RealBin)) {
+    if ($verbose) { print "Changed working directory to pldoh script location: $RealBin\n"; }
+} else {
+    print "ERROR: Failed to change working directory: $!\n";
+    exit 1;
+}
 
 # --------------------------------------------------------------------------------------------
 # Resolve cleos and keosd
@@ -1941,6 +1990,8 @@ if (! -e $pldoh_unlock_sh) {
     print $fh "\n";
     print $fh "# pldoh wallet unlock script\n";
     print $fh "# This script is called by pldoh whenver it attempts to unlock the user's DoH wallet file.\n";
+    #print $fh "# This script doesn't work if you change the location of pldoh. In that case, just delete\n";
+    #print $fh "#   this script and pldoh will recreate it.\n";
     print $fh "# You can add --password=xxxx to avoid having to type the password to unlock the wallet.\n";
     print $fh "#   (If you do so, be aware that your wallet will be immediately compromised if an attacker\n";
     print $fh "#    gains access to your machine!)\n";
@@ -1962,8 +2013,8 @@ if (! -e $pldoh_cleos_sh) {
     print $fh "# pldoh cleos helper script (auto-generated by pldoh)\n";
     print $fh "# This script adds the correct --wallet-url argument to cleos. It will point to\n";
     print $fh "#   the current directory as the wallet directory.\n";
-    print $fh "# This script doesn't work if you change the location of pldoh. In that case, just\n";
-    print $fh "#   delete this script and pldoh will recreate it.\n";
+    #print $fh "# This script doesn't work if you change the location of pldoh. In that case, just\n";
+    #print $fh "#   delete this script and pldoh will recreate it.\n";
     print $fh "# The \$* at the end is replaced by the arguments you are passing to this script.\n";
     print $fh "\n";
     print $fh "$cleos \$*\n";
@@ -1991,7 +2042,7 @@ if (! -e $pldoh_config) {
     print $fh "# pldoh configuration file\n";
     print $fh "\n";
     print $fh "$chain_name_key = UX Network Private Testnet\n";
-    print $fh "$chain_api_key = https://uxnetd.goldenplatform.com\n";
+    print $fh "$chain_api_key = https://ux5.goldenplatform.com\n";
     close($fh);
 }
 
@@ -2406,8 +2457,8 @@ load_all_game_data();
 
 # Cleos passthroughs
 
-if (@opt_cleostx) {
-    my $query_str = "$cleos -u $api " . $opt_cleostx[0] . " -p $player $old_rpc_postfix $postfix";
+if (defined $opt_cleostx) {
+    my $query_str = "$cleos -u $api " . $opt_cleostx . " -p $player $old_rpc_postfix $postfix";
     if (! $mute) { print "Executing cleos (tx): $query_str\n"; }
     $o = `$query_str`;
     if ($? != 0) {
@@ -2424,8 +2475,8 @@ if (@opt_cleostx) {
     print $o;
 }
 
-if (@opt_cleos) {
-    my $query_str = "$cleos -u $api " . $opt_cleos[0] . " $postfix";
+if (defined $opt_cleos) {
+    my $query_str = "$cleos -u $api " . $opt_cleos . " $postfix";
     if (! $mute) { print "Executing cleos: $query_str\n"; }
     $o = `$query_str`;
     if ($? != 0) {
@@ -2955,8 +3006,8 @@ if (@opt_st_withdraw) {
 }
 
 # Token commands
-if (@opt_tk_stake) { run_batch_command("transfer '{\"from\":\"$player\", \"to\":\"" . get_staking() . "\", \"quantity\":\"$opt_tk_stake[0]\", \"memo\":\"$opt_tk_stake[1]:$opt_tk_stake[2]\"}'", get_token()); }
-if (@opt_tk_transfer) { run_batch_command("transfer '{\"from\":\"$player\", \"to\":\"$opt_tk_transfer[0]\", \"quantity\":\"$opt_tk_transfer[1]\", \"memo\":\"$opt_tk_transfer[2]\"}'", get_token()); }
+if (@opt_tk_stake) { run_batch_command("transfer '{\"from\":\"$player\", \"to\":\"" . get_staking() . "\", \"quantity\":\"$opt_tk_stake[0]\", \"memo\":\"$opt_tk_stake[1]:$opt_tk_stake[2]\"}'", get_tokens()); }
+if (@opt_tk_transfer) { run_batch_command("transfer '{\"from\":\"$player\", \"to\":\"$opt_tk_transfer[0]\", \"quantity\":\"$opt_tk_transfer[1]\", \"memo\":\"$opt_tk_transfer[2]\"}'", get_tokens()); }
 
 # --------------------------------------------------------------------------------------------
 # If menu mode, enter menu loop (otherwise exit)

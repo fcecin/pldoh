@@ -1,0 +1,856 @@
+#!/usr/bin/perl
+
+# --------------------------------------------------------------------------
+# testoffice <pldoh-cmd> <masteracc> <puk> <tcn> <prefix> <n> <faction-id> <rseed>
+#
+# pldoh-cmd: path to pldoh and any default arguments (e.g. "../pldoh")
+# masteracc: account name that creates all player accounts
+# puk: public key to use for all created accounts
+# tcn: 0=hgm/tcn 1:hg1/tcn 2:hg2/tc2
+# prefix: appended to 'aaaaaa' suffix to construct the player account names that will run the test
+# n: number of players to generate and play with
+# faction-id: 1=empire 2=confederacy 3=alliance 4=dominion
+# rseed: integer random seed to use. same seed = same character role choices and character votes
+#
+# --------------------------------------------------------------------------
+#
+# This is an automated tester of faction politics, i.e. characters running for officer
+#
+# This test script uses pldoh as a back-end, and it gets the e.g. blockchain API url from it,
+#   as well as the whole wallet setup and wallet unlocking.
+# You must have your pldoh_unlock.sh configured with a --password for this script to be able to
+#   run uninterrupted OR the pldoh wallet must already be manually unlocked.
+#
+# It creates <n> test players with a "<prefix>aaaaaa" -> "<prefix>zzzzzz" pattern as needed to
+#   fulfill <n> test players (the second player is "<prefix>aaaaab" and so on). Accounts are
+#   created, provided you have the available authority and tokens in the provided <masteracc>
+#   (<masteracc> is usually 'eosio' unless you're doing something different).
+#   All created accounts will have its key set to <puk>.
+#
+# Then, it follows the test plan above. All players will create one char for <faction-id> and
+#   then open staking positions, create a character, choose a role, get some TCN and stake it
+#   to the faction governance target, etc.
+#
+# Example invocation:
+#   testoffice "../pldoh -m" eosio EOS5WVsrbfvfmVdd3f2Jo6H7fn4vzhNqfnTBe5EoVgQqxn2Grc4Va 1 'player' 6 4 0
+#
+# This sample line will invoke ../pldoh with --mute in the previous dir (works if invoking from /extras),
+#    master account eosio, given public key for all accounts, will use tc1/hg1 (1), prefix for accounts is
+#    'player' (so playeraaaaaa, playeraaaaab, etc.), will run a test with 6 players (so up to playeraaaaaf),
+#    the faction id is 4 (dominion, do), and the random seed is 0 (so *hopefully* the test is reproducible
+#    with respect to the random roles etc. chosen by players).
+#
+# --------------------------------------------------------------------------
+# test plan
+# 1. create accounts -- ignore duplicate account creation; checks masteracc authorization
+# 2. regplayer -- at this point we will ensure that we have the authorizations in the pldoh wallet for the given puk
+#                 or whatever the key was for the already created player accounts
+# 3. createchar 1 for each player
+# 4. mass farming for resources (whatever) to generate TCN and raise char/player level (may or may not be required)
+# 5. all players join the given faction-id
+# 6. random character role choosing 1 for each player
+#    assertion failure with message: player must be a member of a faction to upgrade characters to tier 2 role
+# 7. - if has TCN, move to next player until all done
+#    - if does not have TCN, then do some work, check again
+#      - if still does not have TCN, wait one minute and check same player again, else move to next player until all done
+# 8. for each player:
+#    - addcandidacy for their character
+# 9. for each player:
+#    - distribute officer votes randomly across all the characters of all the players in this test
+# 10. for each player: (this can only happen after each player has already distributed their votes, actually)
+#     (msg:assertion failure with message: character must set their votes before they can stake to faction governance)
+#    - stake random TCN amounts for the governance target of the chosen faction (fgovernance category)
+# --------------------------------------------------------------------------
+
+use strict;
+use warnings;
+
+# ---------------------------------------------------------
+
+# global setting: all tk_stake into staking targets will be for this day duration
+my $global_staking_duration_days = 365;
+
+# times to mine in step 4
+my $mining_times = 1;
+
+# ---------------------------------------------------------
+
+# Check if all mandatory arguments are provided
+if (@ARGV != 8) {
+    die "Usage: testoffice <pldoh-cmd> <masteracc> <puk> <tcn> <prefix> <n> <faction-id> <rseed>\n";
+}
+
+# Assign command line arguments to variables
+my ($pldoh_cmd, $masteracc, $puk, $tcn, $prefix, $n, $faction_id, $rseed) = @ARGV;
+
+# Print the parsed values
+print "pldoh-cmd: $pldoh_cmd\n";
+print "masteracc: $masteracc\n";
+print "puk: $puk\n";
+print "tcn: $tcn\n";
+print "prefix: $prefix\n";
+print "n: $n\n";
+print "faction-id: $faction_id\n";
+print "rseed: $rseed\n";
+
+# basic validation (won't catch everything; some errors will show up later)
+
+if ($n <= 0) { die "Error: n must be greater than 0\n"; }
+unless ($tcn >= 0 && $tcn <= 2) { die "Error: tcn must be between 0 and 2\n"; }
+unless ($faction_id >= 1 && $faction_id <= 4) { die "Error: faction-id must be between 1 and 4\n"; }
+if (length($prefix) > 6) { die "Error: prefix must have at most 6 characters\n"; }
+if (length($masteracc) < 1) { die "Error: masteracc must have at least 1 character\n"; }
+if (length($masteracc) > 12) { die "Error: masteracc must have at most 12 characters\n"; }
+if (length($puk) != 53) { die "Error: puk must have 50 chars e.g. EOS5WVsrbfvfmVdd3f2Jo6H7fn4vzhNqfnTBe5EoVgQqxn2Grc4Va\n"; }
+if ($pldoh_cmd !~ /pldoh/) { die "Error: pldoh-cmd seems invalid as it does not contain 'pldoh' in it\n"; }
+
+my $tcnsuffix;
+my $hgmsuffix;
+if ($tcn == 0)    { $tcnsuffix = 'tcn'; $hgmsuffix = 'hgm'; }
+elsif ($tcn == 1) { $tcnsuffix = 'tc1'; $hgmsuffix = 'hg1'; }
+elsif ($tcn == 2) { $tcnsuffix = 'tc2'; $hgmsuffix = 'hg2'; }
+
+# set provided random seed
+srand($rseed);
+
+# --------------------------------------------------------------------------
+# subs
+# --------------------------------------------------------------------------
+
+sub diag {
+    if ($? == -1) {
+        print "Failed to execute command: $!\n";
+    } elsif ($? & 127) {
+        printf "Command died with signal %d, %s coredump\n",
+            ($? & 127),  ($? & 128) ? 'with' : 'without';
+    } else {
+        my $exit_code = $? >> 8;
+        if ($exit_code != 0) {
+            print "Command exited with non-zero status: $exit_code\n";
+        } else {
+            # Command executed successfully
+            # Process the $command_output here
+        }
+    }
+}
+
+sub get_next_account {
+    my $pattern = shift;
+    # Convert pattern to array of characters
+    my @chars = split //, $pattern;
+    # Increment the pattern for the next iteration
+    my $idx = scalar(@chars) - 1;
+    while ($idx >= 0) {
+        my $ord = ord($chars[$idx]) + 1;
+        if ($ord > ord('z')) {
+            $chars[$idx] = 'a';
+            $idx--;
+        } else {
+            $chars[$idx] = chr($ord);
+            last;
+        }
+    }
+    # Construct the new pattern
+    my $new_pattern = join '', @chars;
+    return $new_pattern;
+}
+
+sub replace_double_hash {
+    my $command = shift;
+    my $pattern = shift;
+    # Execute the command with the new pattern
+    my $cmd = $command;
+    $cmd =~ s/##/$pattern/g;
+    return $cmd;
+}
+
+sub get_base_random_role {
+    return int(rand(5)) + 1;
+}
+
+sub get_mid_random_role {
+    return int(rand(5)) + 6;
+}
+
+sub get_final_random_role {
+    return int(rand(5)) + 11;
+}
+
+# Unfortunately we can't God Mode a character directly to the role we want
+#sub get_random_role {
+#
+#    my $r = int(rand(50));
+#    if ($r >= 45) {
+#        return ($r - 45) + 11; # 11-15  roles = 1 chance
+#    }
+#    if ($r >= 35) { # 6-10 roles = 2 chances
+#        $r -= 35;
+#        $r /= 2;
+#        return int($r) + 6;
+#    }
+#    $r /= 7; # 1-5 roles = 7 chances
+#    return int($r) + 1;
+#}
+# Tester for the random role generator
+#my $c = 0;
+#while (1) {
+#    my $x = get_random_role();
+#    print "$x, ";
+#    $c++;
+#    if ($c > 20) {
+#        $c = 0;
+#        print "\n";
+#    }
+#}
+
+# ----------------------------------------------------------------------------------------------
+#  tester script starts here:
+# ----------------------------------------------------------------------------------------------
+
+my $suffix;
+
+print "---------------------------------------------------------------------\n";
+print "Step 1: ensuring all accounts are created\n";
+print "---------------------------------------------------------------------\n";
+
+$suffix = 'aaaaaa';
+
+for (my $i = 0; $i < $n; $i++) {
+
+    my $cmd_pattern = qq($pldoh_cmd --player $masteracc --cleostx system newaccount $masteracc ## $puk --stake-cpu "500.0000 UTX" --stake-net "100.0000 UTX" --buy-ram "20.0000 UTXRAM");
+
+    my $accname = $prefix . $suffix; # e.g. 'playeraaaaaa'
+
+    my $cmd = replace_double_hash($cmd_pattern, $accname);
+
+    print "Running: $cmd\n";
+    my $o = `$cmd`;
+    print "====== Begin pldoh output ======\n";
+    print $o;
+    print "======= End pldoh output =======\n";
+
+    if ($o =~ /Error 3090003: Provided keys, permissions, and delays do not satisfy declared authorizations/) {
+        print "ERROR: You don't have the keys for '$masteracc' in your pldoh wallet so you can't mass-create accounts\n";
+        exit 1;
+    }
+
+    if ($o =~ /Error 3050001: Account name already exists/) {
+        print "INFO: Account '$accname' already exist; will assume you have the keys to be able to control it as a game player and move on.\n";
+    }
+
+    diag();
+
+    $suffix = get_next_account($suffix);
+}
+
+print "---------------------------------------------------------------------\n";
+print "Step 2: ensure all accounts that exist now have regplayer'ed\n";
+print "---------------------------------------------------------------------\n";
+
+$suffix = 'aaaaaa';
+
+for (my $i = 0; $i < $n; $i++) {
+
+    my $cmd_pattern = qq($pldoh_cmd -b --player ## --regplayer);
+
+    my $accname = $prefix . $suffix; # e.g. 'playeraaaaaa'
+
+    my $cmd = replace_double_hash($cmd_pattern, $accname);
+
+    print "Running: $cmd\n";
+    my $o = `$cmd`;
+    print "====== Begin pldoh output ======\n";
+    print $o;
+    print "======= End pldoh output =======\n";
+
+    if ($o =~ /ERR-/ || $o =~ /ERROR/) {
+        print "ERROR: pldoh blew up while trying to regplayer, so the test will stop.\n";
+        exit 1;
+    }
+
+    diag();
+
+    $suffix = get_next_account($suffix);
+}
+
+print "---------------------------------------------------------------------\n";
+print "Step 3: create 1 char for each player\n";
+print "---------------------------------------------------------------------\n";
+
+$suffix = 'aaaaaa';
+
+for (my $i = 0; $i < $n; $i++) {
+
+    my $cmd_pattern = qq($pldoh_cmd --player ## --createchar);
+
+    my $accname = $prefix . $suffix; # e.g. 'playeraaaaaa'
+
+    my $cmd = replace_double_hash($cmd_pattern, $accname);
+
+    print "Running: $cmd\n";
+    my $o = `$cmd`;
+    print "====== Begin pldoh output ======\n";
+    print $o;
+    print "======= End pldoh output =======\n";
+
+    if ($o =~ /ERR-/ || $o =~ /ERROR/) {
+        print "ERROR: pldoh blew up while trying to createchar, so the test will stop.\n";
+        exit 1;
+    }
+
+    if ($o =~ /assertion failure with message: not enough items/) {
+        print "INFO: Not enough cryopods; will assume we already created a character for this player and that char is alive.\n";
+    }
+
+    diag();
+
+    $suffix = get_next_account($suffix);
+}
+
+print "---------------------------------------------------------------------\n";
+print "Step 3.5: get the char ID of each player's char\n";
+print "---------------------------------------------------------------------\n";
+
+$suffix = 'aaaaaa';
+
+my %charids;
+
+for (my $i = 0; $i < $n; $i++) {
+
+    my $cmd_pattern = qq($pldoh_cmd -q 2 characters ##);
+
+    my $accname = $prefix . $suffix; # e.g. 'playeraaaaaa'
+
+    my $cmd = replace_double_hash($cmd_pattern, $accname);
+
+    print "Running: $cmd\n";
+    my $o = `$cmd`;
+    print "====== Begin pldoh output ======\n";
+    print $o;
+    print "======= End pldoh output =======\n";
+
+    if ($o =~ /id\s*=>\s*"(\d+)"/) {
+        my $id = $1;
+        print "INFO: Will use character with ID = '$id' for player '$accname' in this test.\n";
+
+        $charids{$accname} = $id;
+
+    } else {
+        print "ERROR: Can't seem to find a character ID to use for player '$accname'. Stopping test.\n";
+        exit 1;
+    }
+
+    diag();
+
+    $suffix = get_next_account($suffix);
+}
+
+print "---------------------------------------------------------------------\n";
+print "Step 4: mass farming for resources (TCN generation or level upgrade if ever required)\n";
+print "---------------------------------------------------------------------\n";
+
+$suffix = 'aaaaaa';
+
+for (my $i = 0; $i < $n; $i++) {
+
+    my $accname = $prefix . $suffix; # e.g. 'playeraaaaaa'
+
+    my $char_id = $charids{$accname};
+
+    my $cmd_pattern = qq($pldoh_cmd --player ## --dofarming $char_id);
+
+    my $cmd = replace_double_hash($cmd_pattern, $accname);
+
+    for (my $j = 0; $j < $mining_times; $j++) {   # try $mining_times times at most
+
+        print "Doing ($j) some work for player $accname char_id $char_id...\n";
+        print "Running: $cmd\n";
+        my $o = `$cmd`;
+        print "====== Begin pldoh output ======\n";
+        print $o;
+        print "======= End pldoh output =======\n";
+
+        if ($o =~ /ERR-/ || $o =~ /ERROR/) {
+            print "ERROR: pldoh blew up while trying to make player $accname charid $char_id do some work, so the test will stop.\n";
+            exit 1;
+        }
+
+        if ($o =~ /assertion failure/) {
+            print "INFO: Some whatever game logic went wrong trying to work char $char_id so we will just stop doing it and move on to the next player's char if any.\n";
+            last;
+        }
+
+        diag();
+    }
+
+    $suffix = get_next_account($suffix);
+}
+
+print "---------------------------------------------------------------------\n";
+print "Step 5: each player join the given faction-id\n";
+print "---------------------------------------------------------------------\n";
+
+$suffix = 'aaaaaa';
+
+for (my $i = 0; $i < $n; $i++) {
+
+    my $cmd_pattern = qq($pldoh_cmd --player ## --joinfaction $faction_id);
+
+    my $accname = $prefix . $suffix; # e.g. 'playeraaaaaa'
+
+    my $cmd = replace_double_hash($cmd_pattern, $accname);
+
+    print "Running: $cmd\n";
+    my $o = `$cmd`;
+    print "====== Begin pldoh output ======\n";
+    print $o;
+    print "======= End pldoh output =======\n";
+
+    if ($o =~ /ERR-/ || $o =~ /ERROR/) {
+        print "ERROR: pldoh blew up while trying to joinfaction, so the test will stop.\n";
+        exit 1;
+    }
+
+    if ($o =~ /assertion failure with message: player is already part of a faction/) {
+        print "INFO: Trying to joinfaction $faction_id for player $accname but player is already in a faction. Will just assume it's already set to the correct faction and move on.\n";
+    } elsif ($o =~ /assertion failure with message/) {
+        print "ERROR: Game logic blew up somewhere trying to joinfaction $faction_id for player $accname. This is probably bad, so tester will stop.\n";
+        exit 1;
+    }
+
+    diag();
+
+    $suffix = get_next_account($suffix);
+}
+
+print "---------------------------------------------------------------------\n";
+print "Step 6: random BASE character role choosing for all players\n";
+print "        (each player has 1 char)\n";
+print "---------------------------------------------------------------------\n";
+
+$suffix = 'aaaaaa';
+
+for (my $i = 0; $i < $n; $i++) {
+
+    my $accname = $prefix . $suffix; # e.g. 'playeraaaaaa'
+
+    my $char_role = get_base_random_role();
+
+    my $char_id = $charids{$accname};
+
+    my $cmd_pattern = qq($pldoh_cmd --player ## --upgradechar $char_id $char_role);
+
+    my $cmd = replace_double_hash($cmd_pattern, $accname);
+
+    print "Running: $cmd\n";
+    my $o = `$cmd`;
+    print "====== Begin pldoh output ======\n";
+    print $o;
+    print "======= End pldoh output =======\n";
+
+    if ($o =~ /ERR-/ || $o =~ /ERROR/) {
+        print "ERROR: pldoh blew up while trying to upgradechar player:$accname charid:$char_id role:$char_role, so the test will stop.\n";
+        exit 1;
+    }
+
+    if ($o =~ /assertion failure with message: must be level/) {
+        print "ERROR: Trying to upgrade char $char_id to role $char_role, but failed because the controlling player '$accname' must be of a certain level (you are testing contracts that don't auto god-mode the character level). The test script is not smart enough to deal with this; exiting.\n";
+        exit 1;
+    } elsif ($o =~ /assertion failure/) {
+        print "INFO: Some whatever game logic went wrong trying to upgrade char $char_id to role $char_role and the test script does not care what that is.\n";
+    }
+
+    diag();
+
+    $suffix = get_next_account($suffix);
+}
+
+print "---------------------------------------------------------------------\n";
+print "Step 6.1: random MID character role choosing for all players\n";
+print "          only a % of players will attempt this, and we do not\n";
+print "          check for valid base roles --> mid role beforehand\n";
+print "---------------------------------------------------------------------\n";
+
+# this must be done after a faction is chosen, if we are upgrading chars to a top role
+
+$suffix = 'aaaaaa';
+
+for (my $i = 0; $i < $n; $i++) {
+
+    my $accname = $prefix . $suffix; # e.g. 'playeraaaaaa'
+
+    # only 50% of players will attempt to upgrade to a mid or top role
+    if (rand() < 0.50) { next; }
+
+    my $char_role = get_mid_random_role();
+
+    my $char_id = $charids{$accname};
+
+    my $cmd_pattern = qq($pldoh_cmd --player ## --upgradechar $char_id $char_role);
+
+    my $cmd = replace_double_hash($cmd_pattern, $accname);
+
+    print "Running: $cmd\n";
+    my $o = `$cmd`;
+    print "====== Begin pldoh output ======\n";
+    print $o;
+    print "======= End pldoh output =======\n";
+
+    if ($o =~ /ERR-/ || $o =~ /ERROR/) {
+        print "ERROR: pldoh blew up while trying to upgradechar player:$accname charid:$char_id role:$char_role, so the test will stop.\n";
+        exit 1;
+    }
+
+    if ($o =~ /assertion failure with message: must be level/) {
+        print "INFO: Trying to upgrade char $char_id to role $char_role, but failed because the controlling player '$accname' must be of a certain level (you are testing contracts that don't auto god-mode the character level). This is a mid role so we will just ignore and move on.\n";
+    } elsif ($o =~ /assertion failure/) {
+        print "INFO: Some whatever game logic went wrong trying to upgrade char $char_id to role $char_role and the test script does not care what that is.\n";
+    }
+
+    diag();
+
+    $suffix = get_next_account($suffix);
+}
+
+print "---------------------------------------------------------------------\n";
+print "Step 6.2: random FINAL character role choosing for all players\n";
+print "          only a % of players will attempt this, and we do not\n";
+print "          check for valid mid roles --> final role beforehand\n";
+print "---------------------------------------------------------------------\n";
+
+# this must be done after a faction is chosen, if we are upgrading chars to a top role
+
+$suffix = 'aaaaaa';
+
+for (my $i = 0; $i < $n; $i++) {
+
+    my $accname = $prefix . $suffix; # e.g. 'playeraaaaaa'
+
+    # only 50% of players will attempt to upgrade to a top role
+    # doesn't even check if the base role is mid, let alone a valid mid
+    if (rand() < 0.50) { next; }
+
+    my $char_role = get_final_random_role();
+
+    my $char_id = $charids{$accname};
+
+    my $cmd_pattern = qq($pldoh_cmd --player ## --upgradechar $char_id $char_role);
+
+    my $cmd = replace_double_hash($cmd_pattern, $accname);
+
+    print "Running: $cmd\n";
+    my $o = `$cmd`;
+    print "====== Begin pldoh output ======\n";
+    print $o;
+    print "======= End pldoh output =======\n";
+
+    if ($o =~ /ERR-/ || $o =~ /ERROR/) {
+        print "ERROR: pldoh blew up while trying to upgradechar player:$accname charid:$char_id role:$char_role, so the test will stop.\n";
+        exit 1;
+    }
+
+    if ($o =~ /assertion failure with message: must be level/) {
+        print "INFO: Trying to upgrade char $char_id to role $char_role, but failed because the controlling player '$accname' must be of a certain level (you are testing contracts that don't auto god-mode the character level). This is a top-tier role so tester will ignore and move on.\n";
+    } elsif ($o =~ /assertion failure/) {
+        print "INFO: Some whatever game logic went wrong trying to upgrade char $char_id to role $char_role and the test script does not care what that is.\n";
+    }
+
+    diag();
+
+    $suffix = get_next_account($suffix);
+}
+
+print "---------------------------------------------------------------------\n";
+print "Step 6.3. Figure out what char roles each player actually got\n";
+print "---------------------------------------------------------------------\n";
+
+my %charroles;
+
+$suffix = 'aaaaaa';
+
+for (my $i = 0; $i < $n; $i++) {
+
+    my $cmd_pattern = qq($pldoh_cmd -q 2 characters ##);
+
+    my $accname = $prefix . $suffix; # e.g. 'playeraaaaaa'
+
+    my $cmd = replace_double_hash($cmd_pattern, $accname);
+
+    print "Running: $cmd\n";
+    my $o = `$cmd`;
+    print "====== Begin pldoh output ======\n";
+    print $o;
+    print "======= End pldoh output =======\n";
+
+    # This should work even if the player has multiple characters, as both the 'id' and the 'character_role' regexps will match the first
+    if ($o =~ /character_role\s*=>\s*"(\d+)"/) {
+        my $char_role = $1;
+        print "INFO: Player '$accname' has character that ended up with role = '$char_role' in this test.\n";
+
+        $charroles{$accname} = $char_role;
+
+    } else {
+        print "ERROR: Can't seem to find a character_role to use for player '$accname'. Stopping test.\n";
+        exit 1;
+    }
+
+    diag();
+
+    $suffix = get_next_account($suffix);
+}
+
+print "---------------------------------------------------------------------\n";
+print "Step 7. Wait until every player has a TCN balance\n";
+print "---------------------------------------------------------------------\n";
+
+#for each player:
+#    - if has TCN, move to next player until all done
+#    - if does not have TCN, then do some work, check again
+#      - if still does not have TCN, wait one minute and check same player again, else move to next player until all done
+
+$suffix = 'aaaaaa';
+
+my %tcnbalances;
+
+for (my $i = 0; $i < $n; $i++) {
+
+    my $tries = 0;
+
+    while (1) {
+
+        my $cmd_pattern = qq($pldoh_cmd --contract tokens.$tcnsuffix -s accounts ##);
+
+        my $accname = $prefix . $suffix; # e.g. 'playeraaaaaa'
+
+        my $char_id = $charids{$accname};
+
+        my $cmd = replace_double_hash($cmd_pattern, $accname);
+
+        print "Running: $cmd\n";
+        my $o = `$cmd`;
+        print "====== Begin pldoh output ======\n";
+        print $o;
+        print "======= End pldoh output =======\n";
+
+        if ($o =~ /ERR-/ || $o =~ /ERROR/) {
+            print "ERROR: pldoh blew up while querying a TCN balance. Tester giving up.\n";
+            exit 1;
+        }
+
+        diag();
+
+        if ($o =~ /balance\s+=>\s+"(\d+\.\d+)\s+TCN"/) {
+            my $tcn_amount = $1;
+
+            $tcnbalances{$accname} = $tcn_amount;
+
+            # "TCN 0.0000" triggers this but we don't care.
+
+            print "Got some TCN balance for player '$accname': '$tcn_amount'. Moving to next player if any.\n";
+
+            last;
+
+        } else {
+
+            # sleep before doing more work if we have already done work
+
+            if ($tries > 0) {
+                print "Sleeping for 60 seconds before doing work again...\n";
+                sleep(60);
+                print  "...Done sleeping.\n";
+            }
+
+            $tries++;
+
+            # do some work, which may trigger a TCN distribution (also generates more TCN)
+
+            $cmd_pattern = qq($pldoh_cmd --player ## --dofarming $char_id);
+
+            $cmd = replace_double_hash($cmd_pattern, $accname);
+
+            print "Doing some work (TCN checker step: try $tries) for player $accname char_id $char_id...\n";
+            print "Running: $cmd\n";
+            $o = `$cmd`;
+            print "====== Begin pldoh output ======\n";
+            print $o;
+            print "======= End pldoh output =======\n";
+
+            if ($o =~ /ERR-/ || $o =~ /ERROR/) {
+                print "ERROR: pldoh blew up while trying to make player $accname charid $char_id do some work (in TCN checker), so the test will stop.\n";
+                exit 1;
+            }
+
+            if ($o =~ /assertion failure/) {
+                print "INFO: Some whatever game logic went wrong trying to work char $char_id. Since we are doing TCN checks, this is bad (can't generate TCN), so tester will give up.\n";
+                exit 1;
+            }
+
+            diag();
+        }
+    }
+
+    $suffix = get_next_account($suffix);
+}
+
+print "---------------------------------------------------------------------\n";
+print "Step 8. Addcandidacy for each player's character\n";
+print "---------------------------------------------------------------------\n";
+
+$suffix = 'aaaaaa';
+
+for (my $i = 0; $i < $n; $i++) {
+
+    my $accname = $prefix . $suffix; # e.g. 'playeraaaaaa'
+
+    my $char_id = $charids{$accname};
+
+    my $cmd_pattern = qq($pldoh_cmd --player ## --addcandidacy $char_id);
+
+    my $cmd = replace_double_hash($cmd_pattern, $accname);
+
+    print "Running: $cmd\n";
+    my $o = `$cmd`;
+    print "====== Begin pldoh output ======\n";
+    print $o;
+    print "======= End pldoh output =======\n";
+
+    if ($o =~ /ERR-/ || $o =~ /ERROR/) {
+        print "ERROR: pldoh blew up while trying for player $accname to --addcandidacy $char_id, so the test will stop.\n";
+        exit 1;
+    }
+
+    if ($o =~ /assertion failure with message/) {
+        print "INFO: Game logic blew up somewhere trying to addcandidacy. Will just assume the player already has already added the candidate and move on.\n";
+    }
+
+    diag();
+
+    $suffix = get_next_account($suffix);
+}
+
+print "---------------------------------------------------------------------\n";
+print "Step 9. Each player votes for a bunch of random characters\n";
+print "---------------------------------------------------------------------\n";
+
+$suffix = 'aaaaaa';
+
+for (my $i = 0; $i < $n; $i++) {
+
+    # come up with a bunch of random votes for this player, one per role if there are any candidates for a given role 1-15
+
+    my @randomChars;
+    foreach my $role (1..15) {
+        my @matchingPlayers = grep { $charroles{$_} == $role } keys %charroles;
+        next unless @matchingPlayers; # Skip if no characters for this role number
+        my $randomPlayer = $matchingPlayers[int(rand(@matchingPlayers))];
+        push @randomChars, $charids{$randomPlayer};
+    }
+    my $votesarg = join(',', @randomChars);
+
+    # run setvotes cmd on the selected character candidates list
+
+    my $accname = $prefix . $suffix; # e.g. 'playeraaaaaa'
+
+    my $cmd_pattern = qq($pldoh_cmd --player ## --setvotes ## $votesarg);
+
+    my $cmd = replace_double_hash($cmd_pattern, $accname);
+
+    print "Running: $cmd\n";
+    my $o = `$cmd`;
+    print "====== Begin pldoh output ======\n";
+    print $o;
+    print "======= End pldoh output =======\n";
+
+    if ($o =~ /ERR-/ || $o =~ /ERROR/) {
+        print "ERROR: pldoh blew up while trying for player $accname to --setvotes '$votesarg', so the test will stop.\n";
+        exit 1;
+    }
+
+    if ($o =~ /assertion failure with message/) {
+        print "ERROR: Game logic blew up somewhere trying to setvotes. This is probably bad, so the tester will stop.\n";
+        exit 1;
+    }
+
+    diag();
+
+    $suffix = get_next_account($suffix);
+}
+
+print "---------------------------------------------------------------------\n";
+print "Step 10. All players stake TCN to the faction governance\n";
+print "---------------------------------------------------------------------\n";
+
+$suffix = 'aaaaaa';
+
+# 10. for each player:
+#    - stake random TCN amounts for the governance target of the chosen faction (fgovernance category)
+
+my $faction_code = "BADFACTIONCODE";
+
+if ($faction_id == 1) { $faction_code = "em"; }
+elsif ($faction_id == 2) { $faction_code = "co"; }
+elsif ($faction_id == 3) { $faction_code = "al"; }
+elsif ($faction_id == 4) { $faction_code = "do"; }
+
+my $staking_target = "gov." . $faction_code . "." . $hgmsuffix;
+
+print "Staking target for all test players will be: $staking_target\n";
+
+for (my $i = 0; $i < $n; $i++) {
+
+    # 10.A : open staking balance to staking target
+
+    my $cmd_pattern = qq($pldoh_cmd --player ## --st_stake $staking_target);
+
+    my $accname = $prefix . $suffix; # e.g. 'playeraaaaaa'
+
+    my $cmd = replace_double_hash($cmd_pattern, $accname);
+
+    print "Running: $cmd\n";
+    my $o = `$cmd`;
+    print "====== Begin pldoh output ======\n";
+    print $o;
+    print "======= End pldoh output =======\n";
+
+    if ($o =~ /ERR-/ || $o =~ /ERROR/) {
+        print "ERROR: pldoh blew up while trying to --st_stake, so the test will stop.\n";
+        exit 1;
+    }
+
+    if ($o =~ /assertion failure with message/) {
+        print "INFO: Game logic blew up somewhere trying to make player $accname open a TCN stake balance to target $staking_target. For now we will just ignore this and proceed to trying to stake some TCN.\n";
+    }
+
+    diag();
+
+    # 10.B stake 10% of the available TCN
+
+    my $amount_to_stake = sprintf("%.4f", $tcnbalances{$accname} / 10) . " TCN";
+
+    print "Player $accname will stake '$amount_to_stake' to faction governance.\n";
+
+    $cmd_pattern = qq($pldoh_cmd --player ## --tk_stake "$amount_to_stake" $staking_target $global_staking_duration_days);
+
+    $cmd = replace_double_hash($cmd_pattern, $accname);
+
+    print "Running: $cmd\n";
+    $o = `$cmd`;
+    print "====== Begin pldoh output ======\n";
+    print $o;
+    print "======= End pldoh output =======\n";
+
+    if ($o =~ /ERR-/ || $o =~ /ERROR/) {
+        print "ERROR: pldoh blew up while trying to --tk_stake, so the test will stop.\n";
+        exit 1;
+    }
+
+    if ($o =~ /assertion failure with message/) {
+        print "INFO: Game logic blew up somewhere trying to make player $accname stake some TCN to faction governance. For now we will just ignore this and proceed to the next player.\n";
+    }
+
+    diag();
+
+    # 10.C next player
+
+    $suffix = get_next_account($suffix);
+}
