@@ -1539,7 +1539,9 @@ my @opt_dobuild;
 my @opt_docancelproj;
 my @opt_docivil;
 my @opt_docommerce;
+my @opt_docontrol;
 my @opt_docraft;
+my @opt_dodevelop;
 my @opt_dodisembark;
 my @opt_doeat;
 my @opt_doembark;
@@ -1626,7 +1628,9 @@ GetOptions(
     'docancelproj=s{2}' => \@opt_docancelproj,  # character-id, project-id
     'docivil=s{1}'      => \@opt_docivil,       # character-id
     'docommerce=s{1}'   => \@opt_docommerce,    # character-id
+    'docontrol=s{1}'    => \@opt_docontrol,     # character-id
     'docraft=s{2}'      => \@opt_docraft,       # character-id, recipe-id
+    'dodevelop=s{1}'    => \@opt_dodevelop,     # character-id
     'dodisembark=s{1}'  => \@opt_dodisembark,   # character-id
     'doeat=s{1}'        => \@opt_doeat,         # character-id
     'doembark=s{2}'     => \@opt_doembark,      # character-id, vehicle-id
@@ -1744,9 +1748,11 @@ if ($opt_help) {
     print "  --doaddproj <c> <b>         Char c creates a new project using blueprint-id b\n";
     print "  --dobuild <c> <p>           Char c spends energy assembling project p\n";
     print "  --docancelproj <c> <p>      Char c destroys project p\n";
-    print "  --docivil <c> <p>           Char c produces CONTROL\n";
-    print "  --docommerce <c> <p>        Char c produces ECONOMY\n";
+    print "  --docivil <c>               Char c produces CONTROL\n";
+    print "  --docommerce <c>            Char c produces ECONOMY\n";
+    print "  --docontrol <c>             Char c increases faction control over current tile\n";
     print "  --docraft <c> <r>           Char c crafts item using crafting recipe r\n";
+    print "  --dodevelop <c>             Char c decreases wildness of current tile\n";
     print "  --dodisembark <c>           Char c disembarks from the vehicle it is in\n";
     print "  --doeat <c>                 Char c consumes 1 FOOD\n";
     print "  --doembark <c> <v>          Char c embarks on vehicle id v\n";
@@ -1809,7 +1815,7 @@ if ($opt_batch || @opt_map || @opt_route
 
 if ($opt_cleos || $opt_cleostx    # will potentially need it, so just require it, to simplify (dev options anyway)
     || $opt_createchar || @opt_detokenize || @opt_dodropoff || @opt_doload || @opt_domove || @opt_dopickup || @opt_dounload || @opt_joinfaction || @opt_tokenize
-    || @opt_doaddmats || @opt_doaddproj || @opt_dobuild || @opt_docancelproj || @opt_docivil || @opt_docommerce || @opt_docraft || @opt_dodisembark || @opt_doeat || @opt_doembark || @opt_doeng || @opt_doequip || @opt_dofarming || @opt_dohealth || @opt_dointel || @opt_dologis || @opt_domilitary || @opt_domining || @opt_doresearch || @opt_dounequip || @opt_revivechar || @opt_upgradechar
+    || @opt_doaddmats || @opt_doaddproj || @opt_dobuild || @opt_docancelproj || @opt_docivil || @opt_docommerce || @opt_docontrol || @opt_docraft || @opt_dodevelop || @opt_dodisembark || @opt_doeat || @opt_doembark || @opt_doeng || @opt_doequip || @opt_dofarming || @opt_dohealth || @opt_dointel || @opt_dologis || @opt_domilitary || @opt_domining || @opt_doresearch || @opt_dounequip || @opt_revivechar || @opt_upgradechar
     || @opt_propose || @opt_voteprop || @opt_unvoteprop || @opt_addcandidacy || @opt_remcandidacy || @opt_setvotes
     || @opt_st_close || @opt_st_detokenize || @opt_st_open || @opt_st_stake || @opt_st_unstake || @opt_st_withdraw
     || @opt_tk_stake || @opt_tk_transfer
@@ -2940,7 +2946,9 @@ if (@opt_dobuild)      { run_batch_command("dobuild '{\"character_id\":\"$opt_do
 if (@opt_docancelproj) { run_batch_command("docancelproj '{\"character_id\":\"$opt_docancelproj[0]\", \"project_id\":\"$opt_docancelproj[1]\"}'"); }
 if (@opt_docivil)      { run_batch_command("dowork '{\"character_id\":\"$opt_docivil[0]\",\"activity\":7}'"); }
 if (@opt_docommerce)   { run_batch_command("dowork '{\"character_id\":\"$opt_docommerce[0]\",\"activity\":6}'"); }
+if (@opt_docontrol)    { run_batch_command("docontrol '{\"character_id\":\"$opt_docontrol[0]\"}'"); }
 if (@opt_docraft)      { run_batch_command("docraft '{\"character_id\":\"$opt_docraft[0]\", \"recipe_id\":\"$opt_docraft[1]\"}'"); }
+if (@opt_dodevelop)    { run_batch_command("dodevelop '{\"character_id\":\"$opt_dodevelop[0]\"}'"); }
 if (@opt_dodisembark)  { run_batch_command("dodisembark '{\"character_id\":\"$opt_dodisembark[0]\"}'"); }
 if (@opt_doeat)        { run_batch_command("doeat '{\"character_id\":\"$opt_doeat[0]\"}'"); }
 if (@opt_doembark)     { run_batch_command("doembark '{\"character_id\":\"$opt_doembark[0]\", \"vehicle_id\":\"$opt_doembark[1]\"}'"); }
