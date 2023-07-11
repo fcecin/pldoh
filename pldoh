@@ -26,17 +26,39 @@
 #
 # TODO:
 #
+# - testsquad   -- mass testing for squad elections & ranking stuff in the live hg1
+#                  (just sets, then assess the result with certain queries)
+#
+#
+# - look into --> take advantage of:
+#   action return value
+#   read only transactions:  call nodeos, don't modify the state
+#   Enums are returned when you call the read-only contract: readonly.hgm
+#   readonly.hgm::getconstants() --read --json
+#   readonly.hgm::getenums()
+#
+# - dotrain: crafting: builds troops
+#            additional utility for cryopods and clones which you use to build troops
+#            a few different types of troops
+#
+# - doresearch: basic research - for some of the new weapons, buildings
+#
 # - Simplify politics interface:
-#   - voter should always be the selected player (very much probably)
 #   - check groupid == player's faction id / or faction governance forum for faction
 #     proposals -- can I vote in a faction that's not my faction?
 #     can I guess the group id?
-#     external_id => "1"
-#     group_type => "3"
+#     external_id => "1"   --> if the group type is faction, this is the id in the faction TABLE (entry id, primary key, not faction id)
+#     group_type => "3" --> type of group, look at the readonly functions
 #     id => "60"
 #     how to navigate the group space
 #
 # - add politics stubs when they are done (endorse, apply faction)
+#
+# - CI-ready test harness:
+#   - time control (PRs to the contracts)
+#   - RNG injector/roller for the auto tester
+#   - spin up blockchain (test harness)
+#   - contract deployment (test harness)
 #
 # - LATER: getopt::long is not enforcing max number of args in an option
 #
@@ -1663,13 +1685,13 @@ GetOptions(
 
     # Politics commands
     'addcandidacy=s{1}' => \@opt_addcandidacy,  # character_id [auth:char->owner]
-    'propose-fb=s{4}'   => \@opt_propose_fb,    # voter(player) group_id "bucket names..." "shares uint32..." [auth:voter]
-    'propose-fs=s{5}'   => \@opt_propose_fs,    # voter(player) group_id beneficiary quantity memo [auth:voter]
-    'propose-pp=s{4}'   => \@opt_propose_pp,    # voter(player) group_id leader "rank1 rank2 rank3 ..." [auth:voter]
+    'propose-fb=s{3}'   => \@opt_propose_fb,    # group_id "bucket names..." "shares uint32..." [auth:voter=player]
+    'propose-fs=s{4}'   => \@opt_propose_fs,    # group_id beneficiary quantity memo [auth:voter=player]
+    'propose-pp=s{3}'   => \@opt_propose_pp,    # group_id leader "rank1 rank2 rank3 ..." [auth:voter=player]
     'remcandidacy=s{1}' => \@opt_remcandidacy,  # character_id [auth:char->owner]
-    'setvotes=s{2}'     => \@opt_setvotes,      # player "candidate_id1 candidateid_2 candidateid_3 ..." [auth:player]
-    'unvoteprop=s{2}'   => \@opt_unvoteprop,    # voter(player) proposal_id [auth:voter]
-    'voteprop=s{2}'     => \@opt_voteprop,      # voter(player) proposal_id [auth:voter]
+    'setvotes=s{1}'     => \@opt_setvotes,      # "candidate_id1 candidateid_2 candidateid_3 ..." [auth:player]
+    'unvoteprop=s{1}'   => \@opt_unvoteprop,    # proposal_id [auth:voter=player]
+    'voteprop=s{1}'     => \@opt_voteprop,      # proposal_id [auth:voter=player]
 
     # Staking commands
     'st_close=s{1}'           => \@opt_st_close,       # token-symbol (MINERAL TOOL FOOD CRYOPOD CLONE)
@@ -1789,21 +1811,21 @@ if ($opt_help) {
     print "\n";
     print "Politics commands:\n";
     print "  --addcandidacy <c>            [c]haracter id\n";
-    print "  --propose-fb <v> <g> <b> <s>  Issue a Faction Budget proposal;\n";
-    print "                                [v]oter, [g]roup id, [b]uckets, [s]hares\n";
+    print "  --propose-fb <g> <b> <s>      Player issues a Faction Budget proposal;\n";
+    print "                                [g]roup id, [b]uckets, [s]hares\n";
     print "                                b is a vector of bucket names\n";
     print "                                s is a vector of shares (uint32_t)\n";
-    print "  --propose-fs <v> <g> <b> <q> <m>  Issue a Faction Spend proposal;\n";
-    print "                                    [v]oter, [g]roup id, [b]eneficiary, [q]uantity,\n";
-    print "                                    [m]emo\n";
-    print "  --propose-pp <v> <g> <l> <r>  Issue a Political Playoffs proposal;\n";
-    print "                                [v]oter, [g]roup id, [l]eader, [r]anks\n";
-    print "                                v and l are player account names\n";
+    print "  --propose-fs <g> <b> <q> <m>  Player issues a Faction Spend proposal;\n";
+    print "                                [g]roup id, [b]eneficiary, [q]uantity, [m]emo\n";
+    print "  --propose-pp <g> <l> <r>      Player issues a Political Playoffs proposal;\n";
+    print "                                [g]roup id, [l]eader, [r]anks\n";
+    print "                                l is a player account name\n";
     print "                                r is a vector of group player names to rank\n";
     print "  --remcandidacy <c>            [c]haracter id\n";
-    print "  --setvotes <p> <c>            [p]layer, [c]andidates (character ids vector)\n";
-    print "  --unvoteprop <v> <p>          [v]oter, [p]roposal id\n";
-    print "  --voteprop <v> <p>            [v]oter, [p]roposal id\n";
+    print "  --setvotes <c>                Player sets faction votes for [c]andidates\n";
+    print "                                (character ids vector)\n";
+    print "  --unvoteprop <p>              Player withdraws vote for [p]roposal id\n";
+    print "  --voteprop <p>                Player votes for [p]roposal id\n";
     print "\n";
     print "Staking commands:  (to get all available staking targets, run 'pldoh -q targets')\n";
     print "   --st_close <s>             Close balance for game resource token s (e.g.: 'TOOL')\n";
@@ -2993,28 +3015,28 @@ if (@opt_upgradechar)  { run_batch_command("upgradechar '{\"character_id\":\"$op
 
 # Politics commands
 if (@opt_propose_fb) {
-    my ($buckets_json_param, $num_ranks) = get_array_json_from_list($opt_propose_fb[2]);
-    my ($shares_json_param, $num_ranks) = get_array_json_from_list($opt_propose_fb[3]);
-    run_batch_command("propose '{\"voter\":\"$opt_propose_fb[0]\", \"group_id\":\"$opt_propose_fb[1]\", \"data\":[\"faction_budget_proposal\", {\"buckets\":$buckets_json_param, \"shares\":$shares_json_param}]}'", get_politics());
+    my ($buckets_json_param, $num_buckets) = get_array_json_from_list($opt_propose_fb[1]);
+    my ($shares_json_param, $num_shares) = get_array_json_from_list($opt_propose_fb[2]);
+    run_batch_command("propose '{\"voter\":\"$player\", \"group_id\":\"$opt_propose_fb[0]\", \"data\":[\"faction_budget_proposal\", {\"buckets\":$buckets_json_param, \"shares\":$shares_json_param}]}'", get_politics());
 }
 if (@opt_propose_fs) {
-    run_batch_command("propose '{\"voter\":\"$opt_propose_fs[0]\", \"group_id\":\"$opt_propose_fs[1]\", \"data\":[\"faction_spend_proposal\", {\"beneficiary\":\"$opt_propose_fs[2]\", \"quantity\":\"$opt_propose_fs[3]\", \"memo\":\"$opt_propose_fs[4]\"}]}'", get_politics());
+    run_batch_command("propose '{\"voter\":\"$player\", \"group_id\":\"$opt_propose_fs[0]\", \"data\":[\"faction_spend_proposal\", {\"beneficiary\":\"$opt_propose_fs[1]\", \"quantity\":\"$opt_propose_fs[2]\", \"memo\":\"$opt_propose_fs[3]\"}]}'", get_politics());
 }
 if (@opt_propose_pp) {
-    my ($ranks_json_param, $num_ranks) = get_array_json_from_list($opt_propose_pp[3]);
+    my ($ranks_json_param, $num_ranks) = get_array_json_from_list($opt_propose_pp[2]);
     if ($num_ranks != 5) { # 5 is the squad (group/playoffs) size for the political playoffs
         print "ERR-000: Invalid count of ranks given to --propose: $num_ranks; ranks is a space or comma-separated list of player names.\n";
         exit 1;
     }
-    run_batch_command("propose '{\"voter\":\"$opt_propose_pp[0]\", \"group_id\":\"$opt_propose_pp[1]\", \"data\":[\"political_playoff_proposal\", {\"leader\":\"$opt_propose_pp[2]\", \"ranks\":$ranks_json_param}]}'", get_politics());
+    run_batch_command("propose '{\"voter\":\"$player\", \"group_id\":\"$opt_propose_pp[0]\", \"data\":[\"political_playoff_proposal\", {\"leader\":\"$opt_propose_pp[1]\", \"ranks\":$ranks_json_param}]}'", get_politics());
 }
-if (@opt_voteprop) { run_batch_command("voteprop '{\"voter\":\"$opt_voteprop[0]\", \"proposal_id\":\"$opt_voteprop[1]\"}'", get_politics()); }
-if (@opt_unvoteprop) { run_batch_command("unvoteprop '{\"voter\":\"$opt_unvoteprop[0]\", \"proposal_id\":\"$opt_unvoteprop[1]\"}'", get_politics()); }
+if (@opt_voteprop) { run_batch_command("voteprop '{\"voter\":\"$player\", \"proposal_id\":\"$opt_voteprop[0]\"}'", get_politics()); }
+if (@opt_unvoteprop) { run_batch_command("unvoteprop '{\"voter\":\"$player\", \"proposal_id\":\"$opt_unvoteprop[0]\"}'", get_politics()); }
 if (@opt_addcandidacy) { run_batch_command("addcandidacy '{\"character_id\":\"$opt_addcandidacy[0]\"}'", get_politics()); }
 if (@opt_remcandidacy) { run_batch_command("remcandidacy '{\"character_id\":\"$opt_remcandidacy[0]\"}'", get_politics()); }
 if (@opt_setvotes) { #[$opt_setvotes[1]]  <--this also works, without the quotes per element  [17,3,5] etc.
-    my ($candidates_json_param, $num_candidates) = get_array_json_from_list($opt_setvotes[1]);
-    run_batch_command("setvotes '{\"player\":\"$opt_setvotes[0]\", \"candidates\":$candidates_json_param}'", get_politics());
+    my ($candidates_json_param, $num_candidates) = get_array_json_from_list($opt_setvotes[0]);
+    run_batch_command("setvotes '{\"player\":\"$player\", \"candidates\":$candidates_json_param}'", get_politics());
 }
 
 # Staking commands
