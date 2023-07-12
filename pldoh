@@ -28,7 +28,7 @@
 #
 # - testsquad   -- mass testing for squad elections & ranking stuff in the live hg1
 #                  (just sets, then assess the result with certain queries)
-#
+#   -- finish running tests with testsquad once politics bugs get resolved
 #
 # - look into --> take advantage of:
 #   action return value
@@ -496,6 +496,10 @@ my $no_politics; # will be left undefined, or explicitly set to string value 'fa
 
 my $api = ''; # selected API node URL (default empty = none is defined)
 
+# GetOptions() options that force perlhash or json (used directly by the program)
+my $opt_perlhash;
+my $opt_json;
+
 # Tracks need to check for player accout having the necessary keys to authorize transactions
 #   when in interactive (menu) mode.
 my $need_auth_check = 1;
@@ -519,6 +523,11 @@ my $mute = 0;
 
 # temp
 my $o;
+
+# Mega Dirty trick to simplify the interface to get_cache()
+# This is set to the last valid raw json string obtained by the last call to get_cache()
+#    or '' if something went wrong.
+my $last_get_json_string = '';
 
 # This is the "data model".
 # It was created to load all the table elements that are used to make decisions on program
@@ -841,6 +850,8 @@ sub get_cache {
     if (scalar(@_) != 4) { die "ERR-000: Internal error: get_cache() wrong number of args.\n"; }
     my ($query_str, $cache_item, $cache_expiration_s, $debug) = @_;
 
+    $last_get_json_string = ''; # HACK -- reset value
+
     # See if we have the query result as a non-expired cache entry.
     # If we do, read it from disk and into the $jstr JSON query result string.
     my $jstr;
@@ -871,14 +882,11 @@ sub get_cache {
     if (defined $jstr) {
         my $obj = decode_query_result_json_string($jstr);
         if (defined $obj) {
-            if ($debug) {
-                print "Query cache hit for '$cache_item'\n";
-            }
+            if ($debug) { print "Query cache hit for '$cache_item'\n"; }
+            $last_get_json_string = $jstr; # HACK
             return $obj;
         }
-        if ($debug) {
-            print "Query cache corrupted for '$cache_item'\n";
-        }
+        if ($debug) { print "Query cache corrupted for '$cache_item'\n"; }
         undef $jstr;
     }
 
@@ -918,6 +926,8 @@ sub get_cache {
         open(my $file, '>', $file_path) or die "Cannot open file '$file_path' for writing: $!";
         print $file $jstr;
         close($file);
+
+        $last_get_json_string = $jstr; # HACK
 
     } else {
         undef $obj;
@@ -1126,7 +1136,11 @@ sub run_batch_query {
     if (! $mute) { print "Running Smart Query, contract:'$contract' scope:'$scope' table:'$table' index:'$index' lo:'$lo' hi:'$hi' limit:'$lim'\n"; }
     $o = get_table($contract_table, "$keyopt --limit $lim", 0); # FIXME/TODO: we have to get rid of these 0's for the cache timeout
     if ($o) {
-        print dump_hash($o, 0);
+        if (($mute && !$opt_perlhash) || $opt_json) {
+            print $last_get_json_string; # HACK
+        } else {
+            print dump_hash($o, 0);
+        }
     } else {
         print "ERROR: run_batch_query(): Failed to execute Smart Query for $contract $table $lo $hi.\n";
         exit 1;
@@ -1531,10 +1545,12 @@ if (defined $opt_cleos || defined $opt_cleostx) {
 # General
 my $opt_help;
 my $opt_batch;
+#my $opt_json; -- moved up: state == switch
 my @opt_map;
 my $opt_mute;
 my @opt_nopolitics;
 my @opt_player;
+#my $opt_perlhash; -- moved up: state == switch
 my $opt_purge_cache;
 my $opt_regplayer;
 my @opt_route;
@@ -1628,10 +1644,12 @@ GetOptions(
     # General options
     'help|h'            => \$opt_help,
     'batch|b'           => \$opt_batch,
+    'json'              => \$opt_json,
     'map=s{1}'          => \@opt_map,           # areaname|'all'
     'mute|m'            => \$opt_mute,
     'nopolitics=s{1}'   => \@opt_nopolitics,    # 'false'|'true'
     'p|player=s{1}'     => \@opt_player,        # playername
+    'perlhash'          => \$opt_perlhash,
     'purge-cache'       => \$opt_purge_cache,
     'regplayer'         => \$opt_regplayer,
     'route=s{1}'        => \@opt_route,         # destination-tile-id
@@ -1707,6 +1725,13 @@ GetOptions(
 
 ) or die "ERR-999: Error in command line arguments\n";
 
+# Check options have internal consistency
+
+if ($opt_json && $opt_perlhash) {
+    print "ERR-000: Cannot use --json and --perlhash together.\n";
+    exit 1;
+}
+
 # When an options with optional arg e.g. --players [n] is not specified at all, the array is empty
 #   instead of the array variable remaining undefined.
 # What we want is for the array to be undefined, like the other ones (e.g. dropoff=s{2}) but unfortunately
@@ -1732,11 +1757,14 @@ if ($opt_help) {
     print "General options:\n";
     print "  --batch, -b          Non-interactive mode: process all supplied options and exit\n";
     print "  --help, -h           Print this help and exit\n";
+    print "  --json               Force JSON format for Smart Query results\n";
     print "  --map <area>         Print map of area name; if area is 'all', dump all tiles\n";
     print "  --mute, -m           Suppress some important messages (e.g. wallet unlocking) for\n";
-    print "                       easier reading; will not suppress errors or (most) prompts\n";
+    print "                       easier reading; will not suppress errors or (most) prompts;\n";
+    print "                       Also causes Smart Query to return JSON instead of dump_hash\n";
     print "  --nopolitics <v>     Auto opt in or out of politics; v is 'false' or 'true'\n";
     print "  --player, -p <name>  Select player to play with (blockchain account name)\n";
+    print "  --perlhash           Force pldoh's internal hash dump for Smart Query results\n";
     print "  --purge-cache        Clear players data dir cache (default: './$players_dir/')\n";
     print "  --regplayer          Force registration of selected player if necessary\n";
     print "  --route <dest>       Provides a generic route (qrs hex routing) from the player's\n";
@@ -3024,7 +3052,7 @@ if (@opt_propose_fs) {
 }
 if (@opt_propose_pp) {
     my ($ranks_json_param, $num_ranks) = get_array_json_from_list($opt_propose_pp[2]);
-    if ($num_ranks != 5) { # 5 is the squad (group/playoffs) size for the political playoffs
+    if ($num_ranks < 1) { # actually, squads CAN have less than five players (if there's not enough players to fill a squad with five)
         print "ERR-000: Invalid count of ranks given to --propose: $num_ranks; ranks is a space or comma-separated list of player names.\n";
         exit 1;
     }

@@ -16,6 +16,17 @@
 #
 # This is an automated tester of faction politics, i.e. characters running for officer
 #
+# NOTE: This is NOT a fully-automated, "actual" testcase. This is just an automated contract
+#    poking mechanism. An actual testcase has a verification step that prints pass/fail.
+#    This doesn't have it. It just fills the tables with stuff to manually look at. I.e. it
+#    doesn't have a formal Test Result, but rather an "aftermath".
+#
+# Testcases run inside a test harness. A test harness for DoH requires full reproducibility,
+#    i.e. it must know how to deploy a blockchain, deploy contracts, fill the tables with
+#    assets, control the RNG oracle and all the game's timers.
+#
+# --------------------------------------------------------------------------
+#
 # This test script uses pldoh as a back-end, and it gets the e.g. blockchain API url from it,
 #   as well as the whole wallet setup and wallet unlocking.
 # You must have your pldoh_unlock.sh configured with a --password for this script to be able to
@@ -322,7 +333,7 @@ my %charids;
 
 for (my $i = 0; $i < $n; $i++) {
 
-    my $cmd_pattern = qq($pldoh_cmd -q 2 characters ##);
+    my $cmd_pattern = qq($pldoh_cmd --perlhash -q 2 characters ##);
 
     my $accname = $prefix . $suffix; # e.g. 'playeraaaaaa'
 
@@ -575,7 +586,7 @@ $suffix = 'aaaaaa';
 
 for (my $i = 0; $i < $n; $i++) {
 
-    my $cmd_pattern = qq($pldoh_cmd -q 2 characters ##);
+    my $cmd_pattern = qq($pldoh_cmd --perlhash -q 2 characters ##);
 
     my $accname = $prefix . $suffix; # e.g. 'playeraaaaaa'
 
@@ -623,7 +634,7 @@ for (my $i = 0; $i < $n; $i++) {
 
     while (1) {
 
-        my $cmd_pattern = qq($pldoh_cmd --contract tokens.$tcnsuffix -s accounts ##);
+        my $cmd_pattern = qq($pldoh_cmd --perlhash --contract tokens.$tcnsuffix -s accounts ##);
 
         my $accname = $prefix . $suffix; # e.g. 'playeraaaaaa'
 

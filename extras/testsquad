@@ -1,0 +1,1130 @@
+#!/usr/bin/perl
+
+# --------------------------------------------------------------------------
+# testsquad <pldoh-cmd> <masteracc> <puk> <tcn> <prefix> <n> <faction-id> <rseed>
+#
+# pldoh-cmd: path to pldoh and any default arguments (e.g. "../pldoh")
+# masteracc: account name that creates all player accounts
+# puk: public key to use for all created accounts
+# tcn: 0=hgm/tcn 1:hg1/tcn 2:hg2/tc2
+# prefix: appended to 'aaaaaa' suffix to construct the player account names that will run the test
+# n: number of players to generate and play with
+# faction-id: 1=empire 2=confederacy 3=alliance 4=dominion
+# rseed: integer random seed to use. same seed = same character role choices and character votes
+#
+# --------------------------------------------------------------------------
+#
+# This is an automated tester of the squad game politics, i.e. the Political Playoffs feature
+#
+# NOTE: This is NOT a fully-automated, "actual" testcase. This is just an automated contract
+#    poking mechanism. An actual testcase has a verification step that prints pass/fail.
+#    This doesn't have it. It just fills the tables with stuff to manually look at. I.e. it
+#    doesn't have a formal Test Result, but rather an "aftermath".
+#
+# Testcases run inside a test harness. A test harness for DoH requires full reproducibility,
+#    i.e. it must know how to deploy a blockchain, deploy contracts, fill the tables with
+#    assets, control the RNG oracle and all the game's timers.
+#
+# --------------------------------------------------------------------------
+#
+# This test script uses pldoh as a back-end, and it gets the e.g. blockchain API url from it,
+#   as well as the whole wallet setup and wallet unlocking.
+# You must have your pldoh_unlock.sh configured with a --password for this script to be able to
+#   run uninterrupted OR the pldoh wallet must already be manually unlocked.
+#
+# It creates <n> test players with a "<prefix>aaaaaa" -> "<prefix>zzzzzz" pattern as needed to
+#   fulfill <n> test players (the second player is "<prefix>aaaaab" and so on). Accounts are
+#   created, provided you have the available authority and tokens in the provided <masteracc>
+#   (<masteracc> is usually 'eosio' unless you're doing something different).
+#   All created accounts will have its key set to <puk>.
+#
+# Then, it follows the test plan below. All players will create one char for <faction-id>,
+#   choose a base role (between 1 and 2 only) for them, and then wait until they are picked up by
+#   the squad assigner. Then some of them will propose a Political Playoff proposal with some
+#   probability, and then they will all vote randomly on the available proposals.
+#
+# Contrary to testoffice, this script is hindered by interference. If the faction is full of
+#   other bots in the chosen professions (1 and 2) that this script doesn't control, or inactive
+#   humans, you will just get a bunch of failed squads as the 3-of-5 quorum will be seldom met.
+#
+# Example invocation:
+#   testsquad "../pldoh -m" eosio EOS5WVsrbfvfmVdd3f2Jo6H7fn4vzhNqfnTBe5EoVgQqxn2Grc4Va 1 'player' 1 4 0
+#   testsquad "../pldoh -m" eosio EOS5WVsrbfvfmVdd3f2Jo6H7fn4vzhNqfnTBe5EoVgQqxn2Grc4Va 1 'player' 20 4 0
+#
+# This sample line will invoke ../pldoh with --mute in the previous dir (works if invoking from /extras),
+#    master account eosio, given public key for all accounts, will use tc1/hg1 (1), prefix for accounts is
+#    'player' (so playeraaaaaa, playeraaaaab, etc.), will run a test with 20 players (so up to playeraaaaat),
+#    the faction id is 4 (dominion, do), and the random seed is 0 (so *hopefully* the test is reproducible
+#    with respect to the random roles etc. chosen by players).
+#
+# To see the results of the test:
+#    pldoh -q squads
+#    pldoh -q groups
+#    pldoh -q proposals
+#    pldoh -q characters
+#
+# --------------------------------------------------------------------------
+# test plan
+# 1. create accounts -- ignore duplicate account creation; checks masteracc authorization
+# 2. regplayer -- at this point we will ensure that we have the authorizations in the pldoh wallet for the given puk
+#                 or whatever the key was for the already created player accounts
+# 3. createchar 1 for each player
+# 4. mass farming for resources (whatever) to generate TCN and raise char/player level (may or may not be required)
+# 5. all players join the given faction-id
+# 6. random character role choosing 1 for each player (ROLES 1 AND 2 ONLY, no need to have more than 2 roles for testing)
+# 7. for each player
+#    - wait for character to be in a squad
+#    - make a Political Playoff proposal (if dice roll for that passes -- we don't want every member to propose).
+# 8. for each player:
+#    - vote on a Political Playoff proposal
+# --------------------------------------------------------------------------
+
+use strict;
+use warnings;
+
+use Scalar::Util qw(looks_like_number);
+use POSIX qw(strerror);
+use Time::HiRes qw(sleep);
+use Getopt::Long;
+use File::stat;
+use File::Find;
+use File::Path qw(remove_tree);
+
+# to install: sudo cpan Term::ReadKey
+use Term::ReadKey;
+
+# to install: sudo cpan Curses (?)
+BEGIN { $Curses::OldCurses = 1; }    # FIXME/TODO: can we get rid of this? i.e. convert old curses calls to new curses calls
+use Curses;
+
+# enables big integers across the entire script
+# this allows us to compute and store 128-bit integers for the composite-key idiom
+# "use bigint;" doesn't do what we want. have to use bignum to preserve fractional numbers
+use bignum;
+
+# ---------------------------------------------------------
+
+# times to mine in step 4  (DISABLED by default for this test)
+#my $mining_times = 1;
+
+# Global Political Playoffs data model; key == squad_id
+my %playoffs;
+
+# Global Political Playoffs data model: key: player name , value: squad_id (if the player is in multiple squads, will use the "last" one whatever that is)
+my %player_to_squad;
+
+# All proposals (last step)
+my %proposals;
+
+# ---------------------------------------------------------
+
+# Check if all mandatory arguments are provided
+if (@ARGV != 8) {
+    die "Usage: testsquad <pldoh-cmd> <masteracc> <puk> <tcn> <prefix> <n> <faction-id> <rseed>\n";
+}
+
+# Assign command line arguments to variables
+my ($pldoh_cmd, $masteracc, $puk, $tcn, $prefix, $n, $faction_id, $rseed) = @ARGV;
+
+# Print the parsed values
+print "pldoh-cmd: $pldoh_cmd\n";
+print "masteracc: $masteracc\n";
+print "puk: $puk\n";
+print "tcn: $tcn\n";
+print "prefix: $prefix\n";
+print "n: $n\n";
+print "faction-id: $faction_id\n";
+print "rseed: $rseed\n";
+
+# basic validation (won't catch everything; some errors will show up later)
+
+if ($n <= 0) { die "Error: n must be greater than 0\n"; }
+unless ($tcn >= 0 && $tcn <= 2) { die "Error: tcn must be between 0 and 2\n"; }
+unless ($faction_id >= 1 && $faction_id <= 4) { die "Error: faction-id must be between 1 and 4\n"; }
+if (length($prefix) > 6) { die "Error: prefix must have at most 6 characters\n"; }
+if (length($masteracc) < 1) { die "Error: masteracc must have at least 1 character\n"; }
+if (length($masteracc) > 12) { die "Error: masteracc must have at most 12 characters\n"; }
+if (length($puk) != 53) { die "Error: puk must have 50 chars e.g. EOS5WVsrbfvfmVdd3f2Jo6H7fn4vzhNqfnTBe5EoVgQqxn2Grc4Va\n"; }
+if ($pldoh_cmd !~ /pldoh/) { die "Error: pldoh-cmd seems invalid as it does not contain 'pldoh' in it\n"; }
+
+my $tcnsuffix;
+my $hgmsuffix;
+if ($tcn == 0)    { $tcnsuffix = 'tcn'; $hgmsuffix = 'hgm'; }
+elsif ($tcn == 1) { $tcnsuffix = 'tc1'; $hgmsuffix = 'hg1'; }
+elsif ($tcn == 2) { $tcnsuffix = 'tc2'; $hgmsuffix = 'hg2'; }
+
+# set provided random seed
+srand($rseed);
+
+# --------------------------------------------------------------------------------------------
+# Mini JSON parser copied from JSON::Tiny
+# (Yep, this shouldn't be here, for multiple reasons)
+# --------------------------------------------------------------------------------------------
+
+# To instead have the Tiny.pm file in the current dir as a separate file:
+# use lib '.'; # Find Tiny.pm in current dir
+# use Tiny;    # Simple JSON parser from https://github.com/daoswald/JSON-Tiny/
+
+{
+package JSON::Tiny;
+
+# Minimalistic JSON. Adapted from Mojo::JSON. (c)2012-2015 David Oswald
+# License: Artistic 2.0 license.
+# http://www.perlfoundation.org/artistic_license_2_0
+
+use Scalar::Util 'blessed';
+use Encode ();
+use B;
+
+# our $VERSION = '0.58';
+
+# Literal names
+# Users may override Booleans with literal 0 or 1 if desired.
+our($FALSE, $TRUE) = map { bless \(my $dummy = $_), 'JSON::Tiny::_Bool' } 0, 1;
+
+# Escaped special character map with u2028 and u2029
+my %ESCAPE = (
+  '"'     => '"',
+  '\\'    => '\\',
+  '/'     => '/',
+  'b'     => "\x08",
+  'f'     => "\x0c",
+  'n'     => "\x0a",
+  'r'     => "\x0d",
+  't'     => "\x09",
+  'u2028' => "\x{2028}",
+  'u2029' => "\x{2029}"
+);
+my %REVERSE = map { $ESCAPE{$_} => "\\$_" } keys %ESCAPE;
+
+for(0x00 .. 0x1f) {
+  my $packed = pack 'C', $_;
+  $REVERSE{$packed} = sprintf '\u%.4X', $_ unless defined $REVERSE{$packed};
+}
+
+sub decode_json {
+  my $err = _decode(\my $value, shift);
+
+  # pldoh patch: just return undef if any parse error
+  #return defined $err ? croak $err : $value;
+  return defined $err ? undef : $value;
+}
+
+sub encode_json { Encode::encode 'UTF-8', _encode_value(shift) }
+
+sub false () {$FALSE}  ## no critic (prototypes)
+
+sub from_json {
+  my $err = _decode(\my $value, shift, 1);
+  # pldoh patch: just return undef if any parse error
+  #return defined $err ? croak $err : $value;
+  return defined $err ? undef : $value;
+}
+
+sub j {
+  return encode_json $_[0] if ref $_[0] eq 'ARRAY' || ref $_[0] eq 'HASH';
+  return decode_json $_[0];
+}
+
+sub to_json { _encode_value(shift) }
+
+sub true () {$TRUE} ## no critic (prototypes)
+
+sub _decode {
+  my $valueref = shift;
+
+  eval {
+
+    # Missing input
+    die "Missing or empty input\n" unless length( local $_ = shift );
+
+    # UTF-8
+    $_ = eval { Encode::decode('UTF-8', $_, 1) } unless shift;
+    die "Input is not UTF-8 encoded\n" unless defined $_;
+
+    # Value
+    $$valueref = _decode_value();
+
+    # Leftover data
+    return m/\G[\x20\x09\x0a\x0d]*\z/gc || _throw('Unexpected data');
+  } ? return undef : chomp $@;
+
+  return $@;
+}
+
+sub _decode_array {
+  my @array;
+  until (m/\G[\x20\x09\x0a\x0d]*\]/gc) {
+
+    # Value
+    push @array, _decode_value();
+
+    # Separator
+    redo if m/\G[\x20\x09\x0a\x0d]*,/gc;
+
+    # End
+    last if m/\G[\x20\x09\x0a\x0d]*\]/gc;
+
+    # Invalid character
+    _throw('Expected comma or right square bracket while parsing array');
+  }
+
+  return \@array;
+}
+
+sub _decode_object {
+  my %hash;
+  until (m/\G[\x20\x09\x0a\x0d]*\}/gc) {
+
+    # Quote
+    m/\G[\x20\x09\x0a\x0d]*"/gc
+      or _throw('Expected string while parsing object');
+
+    # Key
+    my $key = _decode_string();
+
+    # Colon
+    m/\G[\x20\x09\x0a\x0d]*:/gc
+      or _throw('Expected colon while parsing object');
+
+    # Value
+    $hash{$key} = _decode_value();
+
+    # Separator
+    redo if m/\G[\x20\x09\x0a\x0d]*,/gc;
+
+    # End
+    last if m/\G[\x20\x09\x0a\x0d]*\}/gc;
+
+    # Invalid character
+    _throw('Expected comma or right curly bracket while parsing object');
+  }
+
+  return \%hash;
+}
+
+sub _decode_string {
+  my $pos = pos;
+
+  # Extract string with escaped characters
+  m!\G((?:(?:[^\x00-\x1f\\"]|\\(?:["\\/bfnrt]|u[0-9a-fA-F]{4})){0,32766})*)!gc; # segfault on 5.8.x in t/20-mojo-json.t
+  my $str = $1;
+
+  # Invalid character
+  unless (m/\G"/gc) {
+    _throw('Unexpected character or invalid escape while parsing string')
+      if m/\G[\x00-\x1f\\]/;
+    _throw('Unterminated string');
+  }
+
+  # Unescape popular characters
+  if (index($str, '\\u') < 0) {
+    $str =~ s!\\(["\\/bfnrt])!$ESCAPE{$1}!gs;
+    return $str;
+  }
+
+  # Unescape everything else
+  my $buffer = '';
+  while ($str =~ m/\G([^\\]*)\\(?:([^u])|u(.{4}))/gc) {
+    $buffer .= $1;
+
+    # Popular character
+    if ($2) { $buffer .= $ESCAPE{$2} }
+
+    # Escaped
+    else {
+      my $ord = hex $3;
+
+      # Surrogate pair
+      if (($ord & 0xf800) == 0xd800) {
+
+        # High surrogate
+        ($ord & 0xfc00) == 0xd800
+          or pos($_) = $pos + pos($str), _throw('Missing high-surrogate');
+
+        # Low surrogate
+        $str =~ m/\G\\u([Dd][C-Fc-f]..)/gc
+          or pos($_) = $pos + pos($str), _throw('Missing low-surrogate');
+
+        $ord = 0x10000 + ($ord - 0xd800) * 0x400 + (hex($1) - 0xdc00);
+      }
+
+      # Character
+      $buffer .= pack 'U', $ord;
+    }
+  }
+
+  # The rest
+  return $buffer . substr $str, pos $str, length $str;
+}
+
+sub _decode_value {
+
+  # Leading whitespace
+  m/\G[\x20\x09\x0a\x0d]*/gc;
+
+  # String
+  return _decode_string() if m/\G"/gc;
+
+  # Object
+  return _decode_object() if m/\G\{/gc;
+
+  # Array
+  return _decode_array() if m/\G\[/gc;
+
+  # Number
+  my ($i) = /\G([-]?(?:0|[1-9][0-9]*)(?:\.[0-9]*)?(?:[eE][+-]?[0-9]+)?)/gc;
+  return 0 + $i if defined $i;
+
+  # True
+  return $TRUE if m/\Gtrue/gc;
+
+  # False
+  return $FALSE if m/\Gfalse/gc;
+
+  # Null
+  return undef if m/\Gnull/gc;  ## no critic (return)
+
+  # Invalid character
+  _throw('Expected string, array, object, number, boolean or null');
+}
+
+sub _encode_array {
+  '[' . join(',', map { _encode_value($_) } @{$_[0]}) . ']';
+}
+
+sub _encode_object {
+  my $object = shift;
+  my @pairs = map { _encode_string($_) . ':' . _encode_value($object->{$_}) }
+    sort keys %$object;
+  return '{' . join(',', @pairs) . '}';
+}
+
+sub _encode_string {
+  my $str = shift;
+  $str =~ s!([\x00-\x1f\x{2028}\x{2029}\\"/])!$REVERSE{$1}!gs;
+  return "\"$str\"";
+}
+
+sub _encode_value {
+  my $value = shift;
+
+  # Reference
+  if (my $ref = ref $value) {
+
+    # Object
+    return _encode_object($value) if $ref eq 'HASH';
+
+    # Array
+    return _encode_array($value) if $ref eq 'ARRAY';
+
+    # True or false
+    return $$value ? 'true' : 'false' if $ref eq 'SCALAR';
+    return $value  ? 'true' : 'false' if $ref eq 'JSON::Tiny::_Bool'; #'JSON_Bool';
+
+    # Blessed reference with TO_JSON method
+    if (blessed $value && (my $sub = $value->can('TO_JSON'))) {
+      return _encode_value($value->$sub);
+    }
+  }
+
+  # Null
+  return 'null' unless defined $value;
+
+  # Number (bitwise operators change behavior based on the internal value type)
+
+  return $value
+    if B::svref_2object(\$value)->FLAGS & (B::SVp_IOK | B::SVp_NOK)
+    # filter out "upgraded" strings whose numeric form doesn't strictly match
+    && 0 + $value eq $value
+    # filter out inf and nan
+    && $value * 0 == 0;
+
+  # String
+  return _encode_string($value);
+}
+
+sub _throw {
+
+  # Leading whitespace
+  m/\G[\x20\x09\x0a\x0d]*/gc;
+
+  # Context
+  my $context = 'Malformed JSON: ' . shift;
+  if (m/\G\z/gc) { $context .= ' before end of data' }
+  else {
+    my @lines = split "\n", substr($_, 0, pos);
+    $context .= ' at line ' . @lines . ', offset ' . length(pop @lines || '');
+  }
+
+  die "$context\n";
+}
+
+# Emulate boolean type
+
+package JSON::Tiny::_Bool;
+use overload '""' => sub { ${$_[0]} }, fallback => 1;
+}
+
+
+# --------------------------------------------------------------------------
+# subs
+# --------------------------------------------------------------------------
+
+sub diag {
+    if ($? == -1) {
+        print "Failed to execute command: $!\n";
+    } elsif ($? & 127) {
+        printf "Command died with signal %d, %s coredump\n",
+            ($? & 127),  ($? & 128) ? 'with' : 'without';
+    } else {
+        my $exit_code = $? >> 8;
+        if ($exit_code != 0) {
+            print "Command exited with non-zero status: $exit_code\n";
+        } else {
+            # Command executed successfully
+            # Process the $command_output here
+        }
+    }
+}
+
+sub get_next_account {
+    my $pattern = shift;
+    # Convert pattern to array of characters
+    my @chars = split //, $pattern;
+    # Increment the pattern for the next iteration
+    my $idx = scalar(@chars) - 1;
+    while ($idx >= 0) {
+        my $ord = ord($chars[$idx]) + 1;
+        if ($ord > ord('z')) {
+            $chars[$idx] = 'a';
+            $idx--;
+        } else {
+            $chars[$idx] = chr($ord);
+            last;
+        }
+    }
+    # Construct the new pattern
+    my $new_pattern = join '', @chars;
+    return $new_pattern;
+}
+
+sub replace_double_hash {
+    my $command = shift;
+    my $pattern = shift;
+    # Execute the command with the new pattern
+    my $cmd = $command;
+    $cmd =~ s/##/$pattern/g;
+    return $cmd;
+}
+
+sub get_base_random_role {
+    return int(rand(2)) + 1;   # ROLES 1 AND 2 ONLY FOR TESTSQUAD to maximize squad count with minimum number of bots
+}
+
+sub decode_query_result_json_string {
+    my $str = shift;
+    my $obj = JSON::Tiny::decode_json $str;
+    return $obj;
+}
+
+# Refresh the ENTIRE political playoffs data
+sub refresh_global_political_playoffs_data_model {
+
+    # Global Political Playoffs data model: all groups that are squads that interest us
+    # the top level hash element is: (squad id) ---> (squad object), where squad ID is also "external ID" for
+    #    the respective group object
+    # each squad object is itself a Perl hash, with with the values that interest us:
+    #  group_id --> the GroupID
+    #  members --> member player names array (it's actually the character owners that get picked in the political playoffs)
+    #  faction --> the squad's faction
+    #  role --> the squad's role
+    #  msigsuccess --> true/false
+    #
+    # the rest is discarded (voting threshold==3, contract='', group type==0, description=='')
+
+    # This will work up to 200 squads and 200 groups across all factions (--limit 200 is the pldoh default)
+
+    print "Refreshing squads...\n";
+    my $sstr = `$pldoh_cmd -m --cleos get table hegemon.$hgmsuffix hegemon.$hgmsuffix squads`;
+    my $sobj = decode_query_result_json_string($sstr);
+    if (!(defined $sobj && exists $sobj->{'rows'} && ref $sobj->{'rows'} eq 'ARRAY')) {
+        print "ERROR: aborting because squad query returned text that isn't valid:\n$sstr\n";
+        exit 1;
+    }
+
+    print "Refreshing groups...\n";
+    my $gstr = `$pldoh_cmd -m --cleos get table politics.$hgmsuffix politics.$hgmsuffix groups`;
+    my $gobj = decode_query_result_json_string($gstr);
+    if (!(defined $gobj && exists $gobj->{'rows'} && ref $gobj->{'rows'} eq 'ARRAY')) {
+        print "ERROR: aborting because group query returned text that isn't valid:\n$gstr\n";
+        exit 1;
+    }
+
+    print "Assembling Political Playoffs data model...\n";
+    %playoffs = ();
+    %player_to_squad = ();
+
+    my $srows_ref = $sobj->{'rows'};
+    foreach my $squad (@$srows_ref) {
+        my $squad_id = $squad->{'id'};
+
+        # search for group that has external_id (group_id) == this squad id
+        my $grows_ref = $gobj->{'rows'};
+        my $group; # will point at the first matching group object (hopefully just one match?)
+        foreach my $g (@$grows_ref) {
+            #print "GROUP EXT ID : ".$g->{'external_id'}."\n";
+            #print "      SQUADID: ".$squad_id."\n";
+            if ($g->{'external_id'} ==  $squad_id) {
+                #print "FOUND MATCH\n";
+                $group = $g;
+                last;
+            }
+        }
+        if (! defined $group) {
+            print "ERROR: cannot find a group with an external ID equal to squad ID == $squad_id\n";
+            exit 1;
+        }
+
+        # insert playoffs object which is a combo of the squad and the group
+        $playoffs{$squad_id} = {
+            'group_id'       => $group->{'id'},
+                'faction_id'     => $squad->{'faction_id'},
+                'character_role' => $squad->{'character_role'},
+                'msig_succeeded' => $squad->{'msig_succeeded'},
+                'members'        => []
+        };
+
+        # push the member account names, discarding the key weight
+        foreach my $pair (@{$group->{'members'}}) {
+            my $first = $pair->{'first'};
+            push @{$playoffs{$squad_id}->{'members'}}, $first;
+
+            $player_to_squad{$first} = $squad_id;
+        }
+    }
+}
+
+
+sub refresh_global_proposals {
+
+    print "Fetching Political Playoffs proposals...\n";
+
+    my $str = `$pldoh_cmd -m --cleos get table politics.$hgmsuffix politics.$hgmsuffix proposals`;
+    my $obj = decode_query_result_json_string($str);
+    if (!(defined $obj && exists $obj->{'rows'} && ref $obj->{'rows'} eq 'ARRAY')) {
+        print "ERROR: aborting because proposals query returned text that isn't valid:\n$str\n";
+        exit 1;
+    }
+
+    print "Parsing Political Playoffs proposals...\n";
+    %proposals = ();
+
+    my $rows_ref = $obj->{'rows'};
+    foreach my $prop (@$rows_ref) {
+        my $prop_id = $prop->{'id'};
+
+        # key: proposal ID
+        # value: perl hash where the key is the field name in the proposals table, and the value is the field value
+        $proposals{$prop_id} = $prop;
+    }
+}
+
+
+# ----------------------------------------------------------------------------------------------
+#  tester script starts here:
+# ----------------------------------------------------------------------------------------------
+
+my $suffix;
+
+print "---------------------------------------------------------------------\n";
+print "Step 1: ensuring all accounts are created\n";
+print "---------------------------------------------------------------------\n";
+
+$suffix = 'aaaaaa';
+
+for (my $i = 0; $i < $n; $i++) {
+
+    my $cmd_pattern = qq($pldoh_cmd --player $masteracc --cleostx system newaccount $masteracc ## $puk --stake-cpu "500.0000 UTX" --stake-net "100.0000 UTX" --buy-ram "20.0000 UTXRAM");
+
+    my $accname = $prefix . $suffix; # e.g. 'playeraaaaaa'
+
+    my $cmd = replace_double_hash($cmd_pattern, $accname);
+
+    print "Running: $cmd\n";
+    my $o = `$cmd`;
+    print "====== Begin pldoh output ======\n";
+    print $o;
+    print "======= End pldoh output =======\n";
+
+    if ($o =~ /Error 3090003: Provided keys, permissions, and delays do not satisfy declared authorizations/) {
+        print "ERROR: You don't have the keys for '$masteracc' in your pldoh wallet so you can't mass-create accounts\n";
+        exit 1;
+    }
+
+    if ($o =~ /Error 3050001: Account name already exists/) {
+        print "INFO: Account '$accname' already exist; will assume you have the keys to be able to control it as a game player and move on.\n";
+    }
+
+    diag();
+
+    $suffix = get_next_account($suffix);
+}
+
+print "---------------------------------------------------------------------\n";
+print "Step 2: ensure all accounts that exist now have regplayer'ed\n";
+print "---------------------------------------------------------------------\n";
+
+$suffix = 'aaaaaa';
+
+for (my $i = 0; $i < $n; $i++) {
+
+    my $cmd_pattern = qq($pldoh_cmd -b --player ## --regplayer);
+
+    my $accname = $prefix . $suffix; # e.g. 'playeraaaaaa'
+
+    my $cmd = replace_double_hash($cmd_pattern, $accname);
+
+    print "Running: $cmd\n";
+    my $o = `$cmd`;
+    print "====== Begin pldoh output ======\n";
+    print $o;
+    print "======= End pldoh output =======\n";
+
+    if ($o =~ /ERR-/ || $o =~ /ERROR/) {
+        print "ERROR: pldoh blew up while trying to regplayer, so the test will stop.\n";
+        exit 1;
+    }
+
+    diag();
+
+    $suffix = get_next_account($suffix);
+}
+
+print "---------------------------------------------------------------------\n";
+print "Step 3: create 1 char for each player\n";
+print "---------------------------------------------------------------------\n";
+
+$suffix = 'aaaaaa';
+
+for (my $i = 0; $i < $n; $i++) {
+
+    my $cmd_pattern = qq($pldoh_cmd --player ## --createchar);
+
+    my $accname = $prefix . $suffix; # e.g. 'playeraaaaaa'
+
+    my $cmd = replace_double_hash($cmd_pattern, $accname);
+
+    print "Running: $cmd\n";
+    my $o = `$cmd`;
+    print "====== Begin pldoh output ======\n";
+    print $o;
+    print "======= End pldoh output =======\n";
+
+    if ($o =~ /ERR-/ || $o =~ /ERROR/) {
+        print "ERROR: pldoh blew up while trying to createchar, so the test will stop.\n";
+        exit 1;
+    }
+
+    if ($o =~ /assertion failure with message: not enough items/) {
+        print "INFO: Not enough cryopods; will assume we already created a character for this player and that char is alive.\n";
+    }
+
+    diag();
+
+    $suffix = get_next_account($suffix);
+}
+
+print "---------------------------------------------------------------------\n";
+print "Step 3.5: get the char ID of each player's char\n";
+print "---------------------------------------------------------------------\n";
+
+$suffix = 'aaaaaa';
+
+my %charids;
+
+for (my $i = 0; $i < $n; $i++) {
+
+    my $cmd_pattern = qq($pldoh_cmd --perlhash -q 2 characters ##);
+
+    my $accname = $prefix . $suffix; # e.g. 'playeraaaaaa'
+
+    my $cmd = replace_double_hash($cmd_pattern, $accname);
+
+    print "Running: $cmd\n";
+    my $o = `$cmd`;
+    print "====== Begin pldoh output ======\n";
+    print $o;
+    print "======= End pldoh output =======\n";
+
+    if ($o =~ /id\s*=>\s*"(\d+)"/) {
+        my $id = $1;
+        print "INFO: Will use character with ID = '$id' for player '$accname' in this test.\n";
+
+        $charids{$accname} = $id;
+
+    } else {
+        print "ERROR: Can't seem to find a character ID to use for player '$accname'. Stopping test.\n";
+        exit 1;
+    }
+
+    diag();
+
+    $suffix = get_next_account($suffix);
+}
+
+print "---------------------------------------------------------------------\n";
+print "Step 4: Skipping (you don't need to level up chars; hopefully the \n";
+print "   game contract you are using enables role choices for new chars)\n";
+print "---------------------------------------------------------------------\n";
+#
+#
+##   You only need to enable this if you are using this script to test the
+##     Political Playoffs feature against a version of the game contracts that
+##     requires chars to be of a certain level to choose a base role.
+##   Ideally, you're using "HG1", a deployment version that has relaxed
+##     leveling restrictions, infinite char energy, etc.
+#
+#print "---------------------------------------------------------------------\n";
+#print "Step 4: mass farming for resources (TCN generation or level upgrade if ever required)\n";
+#print "---------------------------------------------------------------------\n";
+#
+#$suffix = 'aaaaaa';
+#
+#for (my $i = 0; $i < $n; $i++) {
+#
+#    my $accname = $prefix . $suffix; # e.g. 'playeraaaaaa'
+#
+#    my $char_id = $charids{$accname};
+#
+#    my $cmd_pattern = qq($pldoh_cmd --player ## --dofarming $char_id);
+#
+#    my $cmd = replace_double_hash($cmd_pattern, $accname);
+#
+#    for (my $j = 0; $j < $mining_times; $j++) {   # try $mining_times times at most
+#
+#        print "Doing ($j) some work for player $accname char_id $char_id...\n";
+#        print "Running: $cmd\n";
+#        my $o = `$cmd`;
+#        print "====== Begin pldoh output ======\n";
+#        print $o;
+#        print "======= End pldoh output =======\n";
+#
+#        if ($o =~ /ERR-/ || $o =~ /ERROR/) {
+#            print "ERROR: pldoh blew up while trying to make player $accname charid $char_id do some work, so the test will stop.\n";
+#            exit 1;
+#        }
+#
+#        if ($o =~ /assertion failure/) {
+#            print "INFO: Some whatever game logic went wrong trying to work char $char_id so we will just stop doing it and move on to the next player's char if any.\n";
+#            last;
+#        }
+#
+#        diag();
+#    }
+#
+#    $suffix = get_next_account($suffix);
+#}
+
+print "---------------------------------------------------------------------\n";
+print "Step 5: each player join the given faction-id\n";
+print "---------------------------------------------------------------------\n";
+
+$suffix = 'aaaaaa';
+
+for (my $i = 0; $i < $n; $i++) {
+
+    my $cmd_pattern = qq($pldoh_cmd --player ## --joinfaction $faction_id);
+
+    my $accname = $prefix . $suffix; # e.g. 'playeraaaaaa'
+
+    my $cmd = replace_double_hash($cmd_pattern, $accname);
+
+    print "Running: $cmd\n";
+    my $o = `$cmd`;
+    print "====== Begin pldoh output ======\n";
+    print $o;
+    print "======= End pldoh output =======\n";
+
+    if ($o =~ /ERR-/ || $o =~ /ERROR/) {
+        print "ERROR: pldoh blew up while trying to joinfaction, so the test will stop.\n";
+        exit 1;
+    }
+
+    if ($o =~ /assertion failure with message: player is already part of a faction/) {
+        print "INFO: Trying to joinfaction $faction_id for player $accname but player is already in a faction. Will just assume it's already set to the correct faction and move on.\n";
+    } elsif ($o =~ /assertion failure with message/) {
+        print "ERROR: Game logic blew up somewhere trying to joinfaction $faction_id for player $accname. This is probably bad, so tester will stop.\n";
+        exit 1;
+    }
+
+    diag();
+
+    $suffix = get_next_account($suffix);
+}
+
+print "---------------------------------------------------------------------\n";
+print "Step 6: random BASE character role choosing for all players\n";
+print "        (each player has 1 char) -- ROLES 1 AND 2 ONLY\n";
+print "---------------------------------------------------------------------\n";
+
+$suffix = 'aaaaaa';
+
+for (my $i = 0; $i < $n; $i++) {
+
+    my $accname = $prefix . $suffix; # e.g. 'playeraaaaaa'
+
+    my $char_role = get_base_random_role();
+
+    my $char_id = $charids{$accname};
+
+    my $cmd_pattern = qq($pldoh_cmd --player ## --upgradechar $char_id $char_role);
+
+    my $cmd = replace_double_hash($cmd_pattern, $accname);
+
+    print "Running: $cmd\n";
+    my $o = `$cmd`;
+    print "====== Begin pldoh output ======\n";
+    print $o;
+    print "======= End pldoh output =======\n";
+
+    if ($o =~ /ERR-/ || $o =~ /ERROR/) {
+        print "ERROR: pldoh blew up while trying to upgradechar player:$accname charid:$char_id role:$char_role, so the test will stop.\n";
+        exit 1;
+    }
+
+    if ($o =~ /assertion failure with message: must be level/) {
+        print "ERROR: Trying to upgrade char $char_id to role $char_role, but failed because the controlling player '$accname' must be of a certain level (you are testing contracts that don't auto god-mode the character level). The test script is not smart enough to deal with this; exiting.\n";
+        exit 1;
+    } elsif ($o =~ /assertion failure/) {
+        print "INFO: Some whatever game logic went wrong trying to upgrade char $char_id to role $char_role and the test script does not care what that is.\n";
+    }
+
+    diag();
+
+    $suffix = get_next_account($suffix);
+}
+
+print "---------------------------------------------------------------------\n";
+print "Step 6.1. Figure out what char roles each player actually got\n";
+print "---------------------------------------------------------------------\n";
+
+my %charroles;
+
+$suffix = 'aaaaaa';
+
+for (my $i = 0; $i < $n; $i++) {
+
+    my $cmd_pattern = qq($pldoh_cmd --perlhash -q 2 characters ##);
+
+    my $accname = $prefix . $suffix; # e.g. 'playeraaaaaa'
+
+    my $cmd = replace_double_hash($cmd_pattern, $accname);
+
+    print "Running: $cmd\n";
+    my $o = `$cmd`;
+    print "====== Begin pldoh output ======\n";
+    print $o;
+    print "======= End pldoh output =======\n";
+
+    # This should work even if the player has multiple characters, as both the 'id' and the 'character_role' regexps will match the first
+    if ($o =~ /character_role\s*=>\s*"(\d+)"/) {
+        my $char_role = $1;
+        print "INFO: Player '$accname' has character that ended up with role = '$char_role' in this test.\n";
+
+        $charroles{$accname} = $char_role;
+
+    } else {
+        print "ERROR: Can't seem to find a character_role to use for player '$accname'. Stopping test.\n";
+        exit 1;
+    }
+
+    diag();
+
+    $suffix = get_next_account($suffix);
+}
+
+print "---------------------------------------------------------------------\n";
+print "Step 7. Every player waits for their character to be picked up by a\n";
+print "        Squad, and then decides (randomly) whether to make a Political\n";
+print "        Playoff proposal to the squad\n";
+print "---------------------------------------------------------------------\n";
+
+# ************************************************************************************
+#
+#   This was written when a table/index to figure out whether a particular
+#     player's character has been picked up by a squad was not yet available,
+#     so we do a global query for the whole squad situation. This does NOT scale.
+#
+#   We fetch the entire political playoffs data model from the API node once a minute.
+#
+# ************************************************************************************
+
+#
+#  it seems player names may end up in multiple squads or groups; I'm not sure why
+#  that's the case but if we spot the player as a member of any %playoffs element,
+#  we are satisfied
+#
+
+$suffix = 'aaaaaa';
+
+for (my $i = 0; $i < $n; $i++) {
+    my $accname = $prefix . $suffix; # e.g. 'playeraaaaaa'
+    my $tries = 0;
+    while (1) {
+
+        refresh_global_political_playoffs_data_model();
+
+        if (defined $player_to_squad{$accname}) {
+            my $squad_id = $player_to_squad{$accname};
+            print "Spotted player $accname on squad id $squad_id. I guess the PPs picked this one up.\n";
+
+            # *********************************************************************************************************
+            # FIXME/TODO:
+            # force an unvoteprop; we don't even know if we have voted, but in case we have
+            #   we want to try going to a "not having voted" state instead (if this doesn't work, doesn't really matter).
+            # The idea is make this test repeatable with the same accounts without e.g. waiting for squad games
+            #   to resolve and clean up/redo squads, wipe out proposals, etc.
+            # This would require us finding what proposal ID we are voting for and then --unvoteprop <proposal ID>
+            # *********************************************************************************************************
+
+            # Check if we want to make a proposal
+            if (rand() > 0.50) {
+
+                # Assemble proposal
+
+                my $groupid = $playoffs{$squad_id}->{'group_id'};
+
+                my $array_ref = $playoffs{$squad_id}->{'members'};
+                # Shuffle the array using Fisher-Yates algorithm
+                my $array_len = scalar(@$array_ref);
+                for (my $i = $array_len - 1; $i > 0; $i--) {
+                    my $j = int(rand($i + 1));
+                    @$array_ref[$i, $j] = @$array_ref[$j, $i];
+                }
+                my $ranks = join(',', @$array_ref);
+
+                # Execute
+
+                my $cmd_pattern = qq($pldoh_cmd --player ## --propose-pp $groupid ## $ranks); # the $accname (player) nominates itself for leader
+
+                my $cmd = replace_double_hash($cmd_pattern, $accname);
+
+                print "Running: $cmd\n";
+                my $o = `$cmd`;
+                print "====== Begin pldoh output ======\n";
+                print $o;
+                print "======= End pldoh output =======\n";
+
+                if ($o =~ /ERR-/ || $o =~ /ERROR/) {
+                    print "ERROR: pldoh blew up while trying for player '$accname' to --propose-pp '$groupid' '$accname' '$ranks', so the test will stop.\n";
+                    exit 1;
+                }
+
+                if ($o =~ /assertion failure with message: voter has already voted for a competing proposal/) {
+                    print "INFO: Player $accname has already --voteprop (or proposed?). We do not care either way.\n";
+                } elsif ($o =~ /assertion failure with message/) {
+                    print "ERROR: Game logic randomly blew up somewhere trying to --propose-pp '$groupid' '$accname' '$ranks'. This is probably bad, so the tester will stop.\n";
+                    exit 1;
+                }
+
+            } else {
+                print "Player $accname decided to not submit a squad proposal\n";
+            }
+
+            print "Moving on to next player if any.\n";
+
+            last;
+        } else {
+            print "Can't find $accname in squads/groups. Sleeping for 60 seconds before polling groups and squads again (tries: $tries)...\n";
+            sleep(60);
+            print  "...Done sleeping.\n";
+            $tries++;
+        }
+    }
+    $suffix = get_next_account($suffix);
+}
+
+print "---------------------------------------------------------------------\n";
+print "Step 8. Each player votes on a random Playoff Proposal in their squad\n";
+print "---------------------------------------------------------------------\n";
+
+# Fetch all proposals
+
+refresh_global_proposals();
+
+$suffix = 'aaaaaa';
+
+for (my $i = 0; $i < $n; $i++) {
+
+    my $accname = $prefix . $suffix; # e.g. 'playeraaaaaa'
+
+    # For each player
+    # Get the group id
+
+    my $squad_id = $player_to_squad{$accname};
+
+    print "Player $accname seems to be in squad_id $squad_id\n";
+
+    my $squad = $playoffs{$squad_id};
+
+    my $group_id = $squad->{'group_id'};
+
+    print "Player $accname 's squad seems to map to group_id $group_id\n";
+
+    # Find all proposal ids that match the group id
+
+    my @matching_proposals = ();
+
+    foreach my $proposal_id (keys %proposals) {
+        my $inner_hash_ref = $proposals{$proposal_id};
+        my $inner_group_id = $inner_hash_ref->{'group_id'};
+
+        if ($inner_group_id == $group_id) {
+            print "Player $accname 's squad/group seems to have received a proposal with id == $proposal_id\n";
+
+            push @matching_proposals, $proposal_id;
+        }
+    }
+
+    if (scalar @matching_proposals == 0) {
+        print "Player $accname 's squad/group seems to have received NO proposals, so it won't vote on a squad proposal. Moving on to next player if any.\n";
+        next;
+    }
+
+    # Choose one proposal id at random
+
+    my $array_length = scalar @matching_proposals;
+    my $random_index = int(rand($array_length));
+    my $chosen_proposal_id = $matching_proposals[$random_index];
+
+    print "Player $accname has chosen to vote for proposal id == $chosen_proposal_id\n";
+
+    # Call voteprop proposal id
+
+    my $cmd_pattern = qq($pldoh_cmd --player ## --voteprop $chosen_proposal_id);
+
+    my $cmd = replace_double_hash($cmd_pattern, $accname);
+
+    print "Running: $cmd\n";
+    my $o = `$cmd`;
+    print "====== Begin pldoh output ======\n";
+    print $o;
+    print "======= End pldoh output =======\n";
+
+    if ($o =~ /ERR-/ || $o =~ /ERROR/) {
+        print "ERROR: pldoh blew up while trying for player $accname to --voteprop '$chosen_proposal_id', so the test will stop.\n";
+        exit 1;
+    }
+
+    if ($o =~ /assertion failure with message: voter has already voted for a competing proposal/) {
+        print "INFO: Player $accname has already --voteprop (or proposed?). We do not care either way.\n";
+    } elsif ($o =~ /assertion failure with message/) {
+        print "ERROR: Game logic blew up somewhere unrecognized trying player $accname to --voteprop '$chosen_proposal_id'. This is probably bad, so the tester will stop.\n";
+        exit 1;
+    }
+
+    diag();
+
+    $suffix = get_next_account($suffix);
+}
