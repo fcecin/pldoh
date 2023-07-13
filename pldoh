@@ -481,7 +481,7 @@ my $players_dir = "p";   # default name for the subdirectory that contains accou
 
 my $global_data_dir = "_global"; # p/_global/ gets global data (not a player dir)
 
-my $default_query_limit = 200;   # default value for cleos --limit
+my $default_query_limit = 200;   # default value for cleos --limit (can change this default with pldoh --limit as well)
 
 my $forever_seconds = 31536000;   # one year -- cache retention for load_dm() game content
 
@@ -1560,6 +1560,7 @@ my @opt_tcn;
 # Queries
 my @opt_abi;
 my @opt_contract;
+my @opt_limit;
 my @opt_players; # since --query does everything (or /should/ be able to do everything, as far as we know), it's questionable whether we need specialized query commands like --players [pagenum]; --players might be removed in the future.
 my @opt_query;
 my @opt_squery;
@@ -1659,6 +1660,7 @@ GetOptions(
     # Table/ABI queries
     'abi=s{1,2}'        => \@opt_abi,           # fullcontractname|'all', abi-item/key-name
     'contract=s{1}'     => \@opt_contract,      # full contract name (with prefix and suffix, e.g. "hegemon.hgm")
+    'limit=s{1}'        => \@opt_limit,         # new-default-limit
     'players:s'         => \@opt_players,       # [player table page number (first=0)]
     'q|query=s{1,5}'    => \@opt_query,         # [index=1] table [lower] [upper] [limit]
     's|squery=s{2,6}'   => \@opt_squery,        # [index=1] table scope [lower] [upper] [limit]
@@ -1787,7 +1789,8 @@ if ($opt_help) {
     print "                       short summary of contract(s); if s is '.', match everything\n";
     print "  --contract <c>       Contract for table queries (with suffix e.g. \"hegemon.hgm\");\n";
     print "                       if not specified, pldoh will attempt to guess it\n";
-    print "  --players <n>        Get page <n> of players (n >= 0); $default_query_limit per page\n";
+    print "  --limit <n>          Set the default --limit for cleos queries (default: $default_query_limit)\n";
+    print "  --players <n>        Get page <n> of players (n >= 0); --limit players per page\n";
     print "  --query, -q [i] <t> [L] [U] [n]  Run a Smart Query (queries any game table)\n";
     print "      [i]    If first argument is numeric: table index to use (default is 1)\n";
     print "      <t>    Smart Query table name (e.g. \"players\"; contract/scope is guessed)\n";
@@ -1796,7 +1799,7 @@ if ($opt_help) {
     print "              primary index, and iterate to return up to [limit] records)\n";
     print "      [U]    Upper bound key value to return; if '.', no upper bound; if ommitted,\n";
     print "             then the upper bound will be the same as lower bound (exact match)\n";
-    print "      [n]    Max number of records to return, default=$default_query_limit (cleos '--limit' option)\n";
+    print "      [n]    Max number of records to return, default=$default_query_limit (pldoh --limit)\n";
     print "  --squery, -s [i] <t> <s> [L] [U] [n]   Run Smart Query using contract scope s\n";
     print "  --wallet, -w         Print a tokens and staking report for the player\n";
     print "\n";
@@ -1961,6 +1964,15 @@ if (chdir($RealBin)) {
     print "ERROR: Failed to change working directory: $!\n";
     exit 1;
 }
+
+# Deal with --limit
+if (@opt_limit) {
+    if (! looks_like_number($opt_limit[0])) {
+        print "ERR-000: Invalid value given to --limit: " . @opt_limit[0] . "\n";
+    }
+    $default_query_limit = $opt_limit[0];
+}
+if ($verbose) { print "Default query limit is set to " . $default_query_limit . "\n"; }
 
 # --------------------------------------------------------------------------------------------
 # Resolve cleos and keosd
