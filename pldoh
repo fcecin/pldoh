@@ -3437,7 +3437,7 @@ sub cmd_domining {
         return;
     }
 
-    my $cmd = "$cleos -u $api push action hegemon.${hgm} domining '{\"character_id\":\"$sel_char_gid\"}' -p $player $old_rpc_postfix $postfix";
+    my $cmd = "$cleos -u $api push action hegemon.${hgm} dowork '{\"character_id\":\"$sel_char_gid\",\"activity\":1}' -p $player $old_rpc_postfix $postfix";
     printcon("Executing: $cmd");
     $o = `$cmd`;
     if ($? != 0) {
@@ -3455,7 +3455,7 @@ sub cmd_doengineering {
         return;
     }
 
-    my $cmd = "$cleos -u $api push action hegemon.${hgm} doeng '{\"character_id\":\"$sel_char_gid\"}' -p $player $old_rpc_postfix $postfix";
+    my $cmd = "$cleos -u $api push action hegemon.${hgm} dowork '{\"character_id\":\"$sel_char_gid\",\"activity\":2}' -p $player $old_rpc_postfix $postfix";
     printcon("Executing: $cmd");
     $o = `$cmd`;
     if ($? != 0) {
@@ -3473,7 +3473,7 @@ sub cmd_dofarming {
         return;
     }
 
-    my $cmd = "$cleos -u $api push action hegemon.${hgm} dofarming '{\"character_id\":\"$sel_char_gid\"}' -p $player $old_rpc_postfix $postfix";
+    my $cmd = "$cleos -u $api push action hegemon.${hgm} dowork '{\"character_id\":\"$sel_char_gid\",\"activity\":3}' -p $player $old_rpc_postfix $postfix";
     printcon("Executing: $cmd");
     $o = `$cmd`;
     if ($? != 0) {
@@ -3491,7 +3491,7 @@ sub cmd_dologistics {
         return;
     }
 
-    my $cmd = "$cleos -u $api push action hegemon.${hgm} dologis '{\"character_id\":\"$sel_char_gid\"}' -p $player $old_rpc_postfix $postfix";
+    my $cmd = "$cleos -u $api push action hegemon.${hgm} dowork '{\"character_id\":\"$sel_char_gid\",\"activity\":4}' -p $player $old_rpc_postfix $postfix";
     printcon("Executing: $cmd");
     $o = `$cmd`;
     if ($? != 0) {
@@ -3509,7 +3509,7 @@ sub cmd_dohealthcare {
         return;
     }
 
-    my $cmd = "$cleos -u $api push action hegemon.${hgm} dohealth '{\"character_id\":\"$sel_char_gid\"}' -p $player $old_rpc_postfix $postfix";
+    my $cmd = "$cleos -u $api push action hegemon.${hgm} dowork '{\"character_id\":\"$sel_char_gid\",\"activity\":5}' -p $player $old_rpc_postfix $postfix";
     printcon("Executing: $cmd");
     $o = `$cmd`;
     if ($? != 0) {
