@@ -26,10 +26,6 @@
 #
 # TODO:
 #
-# - testsquad   -- mass testing for squad elections & ranking stuff in the live hg1
-#                  (just sets, then assess the result with certain queries)
-#   -- finish running tests with testsquad once politics bugs get resolved
-#
 # - look into --> take advantage of:
 #   action return value
 #   read only transactions:  call nodeos, don't modify the state
@@ -1968,7 +1964,7 @@ if (chdir($RealBin)) {
 # Deal with --limit
 if (@opt_limit) {
     if (! looks_like_number($opt_limit[0])) {
-        print "ERR-000: Invalid value given to --limit: " . @opt_limit[0] . "\n";
+        print "ERR-000: Invalid value given to --limit: " . $opt_limit[0] . "\n";
     }
     $default_query_limit = $opt_limit[0];
 }
