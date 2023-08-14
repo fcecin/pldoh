@@ -26,6 +26,14 @@
 #
 # TODO:
 #
+# - improve:
+#   - PATH/installation/wallet
+#   - config.ini tcn (target) value setting (to avoid running on wrong deployment)
+#     - capture option chosen via --tcn and save that in the ini; --tcn sets the config by default
+#   - interactive player registration flow & prompts
+#
+# - remove showing the experimental Text UI by default (add as an option), default to batch
+#
 # - look into --> take advantage of:
 #   action return value
 #   read only transactions:  call nodeos, don't modify the state
@@ -1700,7 +1708,7 @@ GetOptions(
     'upgradechar=s{2}'  => \@opt_upgradechar,   # character-id, new-role-id
 
     # Politics commands
-    'addcandidacy=s{1}' => \@opt_addcandidacy,  # character_id [auth:char->owner]
+    'addcandidacy=s{2}' => \@opt_addcandidacy,  # character_id role_id [auth:char->owner]
     'propose-fb=s{3}'   => \@opt_propose_fb,    # group_id "bucket names..." "shares uint32..." [auth:voter=player]
     'propose-fs=s{4}'   => \@opt_propose_fs,    # group_id beneficiary quantity memo [auth:voter=player]
     'propose-pp=s{3}'   => \@opt_propose_pp,    # group_id leader "rank1 rank2 rank3 ..." [auth:voter=player]
@@ -1837,7 +1845,7 @@ if ($opt_help) {
     print "  --upgradechar <c> <r>       Upgrade char c to role id r\n";
     print "\n";
     print "Politics commands:\n";
-    print "  --addcandidacy <c>            [c]haracter id\n";
+    print "  --addcandidacy <c> <r>        [c]haracter id [r]ole id\n";
     print "  --propose-fb <g> <b> <s>      Player issues a Faction Budget proposal;\n";
     print "                                [g]roup id, [b]uckets, [s]hares\n";
     print "                                b is a vector of bucket names\n";
@@ -3068,7 +3076,7 @@ if (@opt_propose_pp) {
 }
 if (@opt_voteprop) { run_batch_command("voteprop '{\"voter\":\"$player\", \"proposal_id\":\"$opt_voteprop[0]\"}'", get_politics()); }
 if (@opt_unvoteprop) { run_batch_command("unvoteprop '{\"voter\":\"$player\", \"proposal_id\":\"$opt_unvoteprop[0]\"}'", get_politics()); }
-if (@opt_addcandidacy) { run_batch_command("addcandidacy '{\"character_id\":\"$opt_addcandidacy[0]\"}'", get_politics()); }
+if (@opt_addcandidacy) { run_batch_command("addcandidacy '{\"character_id\":\"$opt_addcandidacy[0]\", \"role\":\"$opt_addcandidacy[1]\"}'", get_politics()); }
 if (@opt_remcandidacy) { run_batch_command("remcandidacy '{\"character_id\":\"$opt_remcandidacy[0]\"}'", get_politics()); }
 if (@opt_setvotes) { #[$opt_setvotes[1]]  <--this also works, without the quotes per element  [17,3,5] etc.
     my ($candidates_json_param, $num_candidates) = get_array_json_from_list($opt_setvotes[0]);
